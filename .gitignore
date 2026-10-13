@@ -1,0 +1,5 @@
+/.venv
+/.web_data
+*.pyc
+/models
+/runs

@@ -37,17 +37,19 @@ class DeepSeekTranslationTests(unittest.TestCase):
         self.assertEqual(post.call_args.kwargs["json"]["thinking"], {"type": "disabled"})
         self.assertEqual(post.call_args.kwargs["headers"]["Authorization"], "Bearer fake-key")
 
-    def test_glossary_filters_unrelated_terms_and_user_overrides(self):
-        packet = {"title": "Lecture", "subject": "Graphics", "glossary": ["shader = 着色器"]}
+    def test_course_analysis_filters_unrelated_terms(self):
+        packet = {"title": "Lecture", "groups": [{"segments": [
+            {"edited_text": "Texture baking is useful for shader design."}]}]}
         candidates = [{"en": "shader", "count": 3, "example": "A shader."},
                       {"en": "texture baking", "count": 2, "example": "Texture baking is useful."}]
-        response = {"content": {"terms": [
-            {"en": "shader", "zh": "错误覆盖"},
+        response = {"content": {"subject": "图形学中的纹理烘焙与着色器", "terms": [
+            {"en": "shader", "zh": "着色器"},
             {"en": "texture baking", "zh": "纹理烘焙"},
             {"en": "invented", "zh": "编造"}]}, "usage": {"total_tokens": 20}}
         with patch.object(deepseek, "call_deepseek", return_value=response):
-            terms, usage = deepseek.refine_glossary("fake-key", deepseek.DEFAULTS, packet, candidates)
-        self.assertEqual(terms, [{"en": "texture baking", "zh": "纹理烘焙", "source": "deepseek"}])
+            subject, terms, usage = deepseek.refine_glossary("fake-key", deepseek.DEFAULTS, packet, candidates)
+        self.assertIn("图形学", subject)
+        self.assertEqual([term["en"] for term in terms], ["shader", "texture baking"])
         self.assertEqual(usage["total_tokens"], 20)
 
     def test_resume_and_srt(self):
@@ -64,11 +66,12 @@ class DeepSeekTranslationTests(unittest.TestCase):
 
             def refine(_key, _config, _packet, _candidates):
                 glossary_calls.append("prepass")
-                return [{"en": "laser", "zh": "激光", "source": "deepseek"}], {"total_tokens": 5}
+                return "光学课程", [{"en": "laser", "zh": "激光", "source": "deepseek"}], {"total_tokens": 5}
 
             def translate(_key, _config, _packet, group):
                 calls.append(group["id"])
                 self.assertIn("laser = 激光", _packet["glossary"])
+                self.assertEqual(_packet["subject"], "光学课程")
                 if group["id"] == "g002" and len(calls) == 2:
                     raise RuntimeError("temporary failure")
                 source = group["segments"][0]

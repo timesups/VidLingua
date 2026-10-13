@@ -17,8 +17,8 @@ SERVICE = "VidLingua DeepSeek"
 ACCOUNT = "local-api-key"
 DEFAULTS = {"model": "deepseek-flash", "temperature": 0.2, "max_tokens": 4096}
 MODELS = {"deepseek-flash", "deepseek-v4-pro"}
-GLOSSARY_VERSION = 1
-TRANSLATION_VERSION = 2
+GLOSSARY_VERSION = 2
+TRANSLATION_VERSION = 3
 
 
 def load_config(path: Path) -> dict:
@@ -91,7 +91,7 @@ def call_deepseek(api_key: str, config: dict, messages: list[dict]) -> dict:
 
 
 SYSTEM_PROMPT = """You translate English lecture subtitles into concise, natural spoken Mandarin Chinese.
-Preserve technical meaning, names, software commands, numbers, units, and course terminology. Use the supplied glossary consistently; user terms take priority over automatic terms. Do not invent unclear words. Fit each line to its time budget without dropping concepts.
+Preserve technical meaning, names, software commands, numbers, units, and course terminology. Use the supplied glossary consistently. Do not invent unclear words. Fit each line to its time budget without dropping concepts.
 Return JSON only. Example JSON: {"segments":[{"id":"s0001","zh":"这是一个例子。","uncertain":false}]}.
 Return exactly one item for every input ID in the same order. If source wording is uncertain, provide the best translation and set uncertain=true.
 Do not include timestamps in the response."""
@@ -136,26 +136,33 @@ def glossary_candidates(packet: dict, limit: int = 50) -> list[dict]:
             for _, key in ranked[:limit]]
 
 
-def refine_glossary(api_key: str, config: dict, packet: dict, candidates: list[dict]) -> tuple[list[dict], dict]:
-    if not candidates:
-        return [], {}
-    payload = {"course": packet["title"], "subject": packet["subject"],
-               "user_glossary": packet["glossary"], "candidates": candidates}
-    system = """You are preparing a terminology glossary for English lecture subtitle translation into Chinese.
-Select only genuine domain terms, product names, or recurring technical phrases from the provided candidates. For each selected English term, provide one concise, context-appropriate Chinese rendering. Keep brand and product names in English when appropriate. Do not invent terms. Never override the user glossary.
-Return JSON only, exactly like {"terms":[{"en":"procedural shader","zh":"程序化着色器"}]}.
+def refine_glossary(api_key: str, config: dict, packet: dict, candidates: list[dict]) -> tuple[str, list[dict], dict]:
+    texts = [s["edited_text"] for g in packet["groups"] for s in g["segments"]]
+    sample = []
+    if texts:
+        indexes = sorted({round(i * (len(texts) - 1) / min(29, len(texts) - 1))
+                          for i in range(min(30, len(texts)))}) if len(texts) > 1 else [0]
+        sample = [texts[i][:350] for i in indexes]
+    payload = {"course": packet["title"], "lecture_samples": sample, "candidates": candidates}
+    system = """Analyze an English lecture before translating subtitles into Chinese.
+From the lecture samples, write a short Chinese description of the actual subject and context (at most 120 Chinese characters). Be specific but do not invent facts. If uncertain, describe only what is clear.
+Select only genuine domain terms, product names, or recurring technical phrases from the supplied candidates. For each selected English term, provide one concise, context-appropriate Chinese rendering. Keep brand and product names in English when appropriate. Do not invent terms.
+Return JSON only: {"subject":"简短课程背景","terms":[{"en":"procedural shader","zh":"程序化着色器"}]}.
 Every en value must exactly match a supplied candidate. Omit common words and uncertain terms."""
     response = call_deepseek(api_key, config, [
         {"role": "system", "content": system},
-        {"role": "user", "content": "Create a reviewed glossary from these candidates. Return JSON.\n"
+        {"role": "user", "content": "Analyze the course and create a glossary. Return JSON.\n"
          + json.dumps(payload, ensure_ascii=False)},
     ])
     data = response["content"]
     terms = data.get("terms") if isinstance(data, dict) else None
     if not isinstance(terms, list):
         raise RuntimeError("DeepSeek 术语整理未返回 terms 列表")
+    subject = data.get("subject")
+    if not isinstance(subject, str) or not subject.strip():
+        raise RuntimeError("DeepSeek 未返回课程背景")
+    subject = " ".join(subject.split())[:160]
     allowed = {item["en"].casefold(): item["en"] for item in candidates}
-    user_terms = {line.split("=", 1)[0].strip().casefold() for line in packet["glossary"] if "=" in line}
     result, seen = [], set()
     for item in terms:
         if not isinstance(item, dict):
@@ -164,11 +171,11 @@ Every en value must exactly match a supplied candidate. Omit common words and un
         if not isinstance(english, str) or not isinstance(chinese, str):
             continue
         key = english.strip().casefold()
-        if key not in allowed or key in user_terms or key in seen or not chinese.strip():
+        if key not in allowed or key in seen or not chinese.strip():
             continue
         seen.add(key)
         result.append({"en": allowed[key], "zh": " ".join(chinese.split()), "source": "deepseek"})
-    return result, response["usage"]
+    return subject, result, response["usage"]
 
 
 def translate_group(api_key: str, config: dict, packet: dict, group: dict) -> tuple[list[dict], dict]:

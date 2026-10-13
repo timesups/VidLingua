@@ -10,7 +10,10 @@ import re
 import statistics
 import subprocess
 import wave
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
+from watermark import drawtext_filter
+from subtitle_burn import subtitle_filter
 from xml.sax.saxutils import escape
 
 import keyring
@@ -19,6 +22,7 @@ import requests
 
 SERVICE = "VidLingua Azure Speech"
 ACCOUNT = "local-speech-key"
+POOL_ACCOUNT = "speech-key-pool"
 VOICES = {
     "zh-CN-YunyangNeural": "云扬 · 男声",
     "zh-CN-XiaoxiaoNeural": "晓晓 · 女声",
@@ -29,10 +33,11 @@ VOICES = {
     "zh-CN-XiaohanNeural": "晓涵 · 女声",
     "zh-CN-YunyeNeural": "云野 · 男声",
 }
-DEFAULTS = {"region": "eastasia", "voice": "zh-CN-YunyangNeural", "base_rate": 1.0,
+DEFAULTS = {"region": "eastasia", "voice": "zh-CN-YunyangNeural",
             "max_synthesis_adjust": 0.10, "max_post_adjust": 0.15,
             "max_global_adjust": 0.08, "max_local_adjust": 0.05,
-            "max_video_adjust": 0.15,
+            "max_video_adjust": 0.18,
+            "per_key_concurrency": 1,
             "background_volume": 0.55}
 # Slow one spoken shot, and speed up only the pause after it, by at most this fraction.
 MAX_VIDEO_ADJUST = 0.15
@@ -40,7 +45,8 @@ SAMPLE_RATE = 24000
 
 
 def load_config(path: Path) -> dict:
-    return {**DEFAULTS, **(json.loads(path.read_text(encoding="utf-8")) if path.is_file() else {})}
+    saved = json.loads(path.read_text(encoding="utf-8")) if path.is_file() else {}
+    return {**DEFAULTS, **{key: value for key, value in saved.items() if key in DEFAULTS}}
 
 
 def validate_config(config: dict) -> dict:
@@ -49,12 +55,15 @@ def validate_config(config: dict) -> dict:
         raise ValueError("Azure 区域格式不正确，例如 eastasia 或 southeastasia")
     if not valid_voice_name(config["voice"]):
         raise ValueError("不支持的 Azure 中文音色")
-    for name, low, high in (("base_rate", .85, 1.15), ("max_synthesis_adjust", 0, .1),
+    for name, low, high in (("max_synthesis_adjust", 0, .1),
                             ("max_post_adjust", 0, .5), ("max_global_adjust", 0, .12),
                             ("max_local_adjust", 0, .1), ("max_video_adjust", 0, .2),
                             ("background_volume", 0, 1)):
         if not low <= float(config[name]) <= high:
             raise ValueError(f"{name} 必须在 {low}–{high} 之间")
+    concurrency = config["per_key_concurrency"]
+    if isinstance(concurrency, bool) or int(concurrency) != concurrency or not 1 <= concurrency <= 8:
+        raise ValueError("每把密钥并发数必须在 1–8 之间")
     return {**config, "region": region}
 
 
@@ -87,7 +96,23 @@ def save_config(path: Path, config: dict) -> None:
 
 
 def get_key() -> str | None:
-    return keyring.get_password(SERVICE, ACCOUNT) or os.environ.get("AZURE_SPEECH_KEY")
+    keys = get_keys()
+    return keys[0] if keys else None
+
+
+def get_keys() -> list[str]:
+    stored = keyring.get_password(SERVICE, POOL_ACCOUNT)
+    if stored:
+        return [validate_key(key) for key in json.loads(stored)]
+    legacy = keyring.get_password(SERVICE, ACCOUNT) or os.environ.get("AZURE_SPEECH_KEY")
+    return [validate_key(legacy)] if legacy else []
+
+
+def set_keys(keys: list[str]) -> None:
+    validated = list(dict.fromkeys(validate_key(key) for key in keys if key.strip()))
+    if not validated or len(validated) > 16:
+        raise ValueError("请填写 1–16 把 Azure Speech 密钥")
+    keyring.set_password(SERVICE, POOL_ACCOUNT, json.dumps(validated))
 
 
 def validate_key(key: str) -> str:
@@ -102,10 +127,11 @@ def set_key(key: str) -> None:
 
 
 def delete_key() -> None:
-    try:
-        keyring.delete_password(SERVICE, ACCOUNT)
-    except keyring.errors.PasswordDeleteError:
-        pass
+    for account in (POOL_ACCOUNT, ACCOUNT):
+        try:
+            keyring.delete_password(SERVICE, account)
+        except keyring.errors.PasswordDeleteError:
+            pass
 
 
 def voice_list(key: str, region: str) -> list[dict]:
@@ -206,7 +232,34 @@ def stretch(samples: np.ndarray, speed: float) -> np.ndarray:
     return read_wav(result.stdout)
 
 
-def make_voice_track(segments: list[dict], config: dict, key: str, cache_dir: Path,
+def _ensure_clips(segments: list[dict], config: dict, keys: list[str], cache_dir: Path,
+                  rate: float, progress=None) -> None:
+    missing = [(segment, cache_dir / f"{segment['id']}-{clip_cache_key(segment, config, rate)}.wav")
+               for segment in segments]
+    pending = [(segment, path) for segment, path in missing if not path.is_file()]
+    completed = len(missing) - len(pending)
+    if progress:
+        progress(completed)
+    if not pending:
+        return
+    executors = [ThreadPoolExecutor(max_workers=int(config["per_key_concurrency"])) for _ in keys]
+    futures = {}
+    try:
+        for index, (segment, path) in enumerate(pending):
+            key_index = index % len(keys)
+            future = executors[key_index].submit(synthesize, keys[key_index], config, segment["zh"], rate)
+            futures[future] = path
+        for future in as_completed(futures):
+            futures[future].write_bytes(future.result())
+            completed += 1
+            if progress:
+                progress(completed)
+    finally:
+        for executor in executors:
+            executor.shutdown(wait=True, cancel_futures=True)
+
+
+def make_voice_track(segments: list[dict], config: dict, key: str | list[str], cache_dir: Path,
                      video_duration: float, progress=None,
                      baseline_info: dict | None = None) -> tuple[np.ndarray, list[dict], list[dict]]:
     cache_dir.mkdir(parents=True, exist_ok=True)
@@ -216,7 +269,10 @@ def make_voice_track(segments: list[dict], config: dict, key: str, cache_dir: Pa
     # Standard voices use a small, distributed pilot to choose one Azure rate.
     # HD cannot use SSML prosody, so its shared baseline is applied after synthesis.
     hd = is_hd_voice(config["voice"])
-    rate = 1.0 if hd else float(config["base_rate"])
+    keys = [key] if isinstance(key, str) else key
+    if not keys:
+        raise ValueError("尚未配置 Azure Speech 密钥")
+    rate = 1.0
     azure_factor = 1.0
     pilot_info = None
     if not hd and len(segments) >= 8 and float(config["max_synthesis_adjust"]) > 0:
@@ -225,12 +281,11 @@ def make_voice_track(segments: list[dict], config: dict, key: str, cache_dir: Pa
             count = min(12, max(4, len(eligible) // 6))
             indices = sorted({eligible[round(i * (len(eligible) - 1) / (count - 1))]
                               for i in range(count)})
+            _ensure_clips([segments[index] for index in indices], config, keys, cache_dir, rate)
             pilot_durations, pilot_windows = [], []
             for index in indices:
                 segment = segments[index]
                 clip_path = cache_dir / f"{segment['id']}-{clip_cache_key(segment, config, rate)}.wav"
-                if not clip_path.is_file():
-                    clip_path.write_bytes(synthesize(key, config, segment["zh"], rate))
                 pilot_durations.append(len(read_wav(clip_path.read_bytes())) / SAMPLE_RATE)
                 pilot_windows.append(segment_window(segments, index, video_duration))
             pilot_info = choose_global_baseline(pilot_durations, pilot_windows, config)
@@ -242,17 +297,14 @@ def make_voice_track(segments: list[dict], config: dict, key: str, cache_dir: Pa
     windows = []
     natural_durations = []
     clips = []
+    _ensure_clips(segments, config, keys, cache_dir, rate, progress)
     for index, segment in enumerate(segments):
         window = segment_window(segments, index, video_duration)
         clip_path = cache_dir / f"{segment['id']}-{clip_cache_key(segment, config, rate)}.wav"
-        if not clip_path.is_file():
-            clip_path.write_bytes(synthesize(key, config, segment["zh"], rate))
         samples = read_wav(clip_path.read_bytes())
         clips.append(clip_path)
         windows.append(window)
         natural_durations.append(len(samples) / SAMPLE_RATE)
-        if progress:
-            progress(index + 1)
     remaining_limit = (1 + float(config["max_global_adjust"])) / azure_factor
     baseline = choose_global_baseline(natural_durations, windows, config,
                                       limit=min(max(1.0, remaining_limit),
@@ -380,7 +432,91 @@ def retimed_segments(segments: list[dict], retiming: list[dict]) -> list[dict]:
     return result
 
 
-def _retime_filter(pieces: list[dict], background_volume: float) -> str:
+def plan_elastic_timeline(segments: list[dict], timings: list[dict], video_duration: float,
+                          max_adjust: float = MAX_VIDEO_ADJUST,
+                          min_gap: float = .05) -> tuple[list[dict], list[dict], list[dict], list[dict], float]:
+    """Stretch each source interval as needed and carry its delay through the rest of the film."""
+    by_id = {item["id"]: item for item in timings}
+    pieces = []
+    cues = []
+    adjustments = []
+    issues = []
+    cursor = 0.0
+    output_cursor = 0.0
+
+    def add_piece(start: float, end: float, speed: float) -> None:
+        if end - start <= 1e-6:
+            return
+        if pieces and abs(pieces[-1]["end"] - start) < 1e-6 and abs(pieces[-1]["speed"] - speed) < 1e-6:
+            pieces[-1]["end"] = end
+        else:
+            pieces.append({"start": start, "end": end, "speed": speed})
+
+    for index, segment in enumerate(segments):
+        start = float(segment["start"])
+        next_start = float(segments[index + 1]["start"]) if index + 1 < len(segments) else video_duration
+        if start < cursor - 1e-5 or next_start <= start:
+            raise ValueError(f"句段 {segment['id']} 的时间顺序无效")
+        if start > cursor:
+            add_piece(cursor, start, 1.0)
+            output_cursor += start - cursor
+        source_span = next_start - start
+        audio_seconds = float(by_id[segment["id"]]["audio_seconds"])
+        gap = min_gap if index + 1 < len(segments) else 0.0
+        desired_span = max(source_span, audio_seconds + gap)
+        desired_speed = source_span / desired_span
+        speed = round(max(1 - max_adjust, desired_speed), 6)
+        actual_span = source_span / speed
+        output_start = output_cursor
+        output_end = output_start + audio_seconds
+        if output_end + gap > output_start + actual_span + .005:
+            issues.append({"id": segment["id"], "kind": "timeline_limit",
+                           "seconds": round(output_end + gap - output_start - actual_span, 3),
+                           "required_video_speed": round(desired_speed, 3),
+                           "suggestion": (f"这一段需放慢到 {desired_speed:.3f} 倍，超出画面调速上限 "
+                                          f"{max_adjust:.0%}；请精简中文台词或提高画面调速上限")})
+        add_piece(start, next_start, speed)
+        cue = dict(segment)
+        cue["start"] = round(output_start, 3)
+        cue["end"] = round(output_end, 3)
+        cues.append(cue)
+        by_id[segment["id"]]["output_start"] = cue["start"]
+        by_id[segment["id"]]["output_end"] = cue["end"]
+        if speed < .999:
+            adjustments.append({"id": segment["id"], "source_start": round(start, 3),
+                                "source_end": round(next_start, 3),
+                                "video_speed": speed,
+                                "added_seconds": round(actual_span - source_span, 3),
+                                "output_start": cue["start"],
+                                "note": "放慢当前句到下句之间的画面与背景音，后续配音和字幕同步顺延"})
+        output_cursor += actual_span
+        cursor = next_start
+    if video_duration > cursor:
+        add_piece(cursor, video_duration, 1.0)
+        output_cursor += video_duration - cursor
+    return pieces, cues, adjustments, issues, output_cursor
+
+
+def assemble_elastic_voice_track(segments: list[dict], timings: list[dict], config: dict,
+                                 cache_dir: Path, output_duration: float) -> np.ndarray:
+    """Place each fitted clip at its retimed start instead of mixing on the source timeline."""
+    by_id = {item["id"]: item for item in timings}
+    track = np.zeros(int((output_duration + 1) * SAMPLE_RATE), dtype=np.int32)
+    for segment in segments:
+        timing = by_id[segment["id"]]
+        rate = float(timing["azure_rate"])
+        clip_path = cache_dir / f"{segment['id']}-{clip_cache_key(segment, config, rate)}.wav"
+        samples = stretch(read_wav(clip_path.read_bytes()), float(timing["post_speed"]))
+        offset = round(float(timing["output_start"]) * SAMPLE_RATE)
+        end = min(len(track), offset + len(samples))
+        track[offset:end] += samples[:end - offset].astype(np.int32)
+    if np.max(np.abs(track), initial=0) > 32767:
+        raise RuntimeError("顺延后的配音轨仍存在重叠，请检查时间轴")
+    return np.clip(track, -32768, 32767).astype("<i2")
+
+
+def _retime_filter(pieces: list[dict], background_volume: float,
+                   video_filter: str | None = None) -> str:
     video_parts = []
     audio_parts = []
     video_labels = []
@@ -396,7 +532,9 @@ def _retime_filter(pieces: list[dict], background_volume: float) -> str:
         video_labels.append(f"[v{index}]")
         audio_labels.append(f"[a{index}]")
     count = len(pieces)
-    video_parts.append(f"{''.join(video_labels)}concat=n={count}:v=1:a=0[v]")
+    video_parts.append(f"{''.join(video_labels)}concat=n={count}:v=1:a=0[{'vbase' if video_filter else 'v'}]")
+    if video_filter:
+        video_parts.append(f"[vbase]{video_filter}[v]")
     audio_parts.append(f"{''.join(audio_labels)}concat=n={count}:v=0:a=1[bg]")
     audio_parts.append(
         f"[bg]volume={background_volume:.3f}[bgv];[bgv][2:a]amix=inputs=2:duration=first:normalize=0,alimiter=limit=0.95[a]")
@@ -404,23 +542,55 @@ def _retime_filter(pieces: list[dict], background_volume: float) -> str:
 
 
 def render_video(source_video: Path, instrumental: Path, voice: Path, destination: Path,
-                 duration: float, background_volume: float, pieces: list[dict] | None = None) -> None:
+                 duration: float, background_volume: float, pieces: list[dict] | None = None,
+                 watermark: dict | None = None, subtitles: dict | None = None,
+                 subtitle_path: Path | None = None) -> None:
+    textfile = destination.with_suffix(".watermark.txt")
+    active_watermark = bool(watermark and watermark.get("enabled") and str(watermark.get("text") or "").strip())
+    if active_watermark:
+        textfile.write_text(str(watermark["text"]).strip(), encoding="utf-8")
+    try:
+        watermark_vf = drawtext_filter(watermark, textfile) if active_watermark else None
+    except Exception:
+        textfile.unlink(missing_ok=True)
+        raise
+    try:
+        subtitle_vf = None
+        if subtitles and subtitles.get("enabled"):
+            if subtitle_path is None or not subtitle_path.is_file():
+                raise ValueError("启用字幕烧录时缺少对应字幕文件")
+            if subtitle_path.parent.resolve() != destination.parent.resolve():
+                raise ValueError("字幕文件应与成片保存在同一目录")
+            subtitle_vf = subtitle_filter(subtitles, subtitle_path.name)
+    except Exception:
+        textfile.unlink(missing_ok=True)
+        raise
+    video_vf = ",".join(filter(None, (subtitle_vf, watermark_vf)))
     retime = bool(pieces) and any(abs(float(piece["speed"]) - 1) >= .001 for piece in pieces)
     if retime:
         command = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-nostdin", "-y",
                    "-i", str(source_video), "-i", str(instrumental), "-i", str(voice),
-                   "-filter_complex", _retime_filter(pieces, background_volume),
+                   "-filter_complex", _retime_filter(pieces, background_volume, video_vf),
                    "-map", "[v]", "-map", "[a]", "-c:v", "libx264", "-preset", "veryfast",
                    "-crf", "18", "-pix_fmt", "yuv420p", "-c:a", "aac",
                    "-t", str(duration), str(destination)]
         failure = "配音视频调速混音失败："
     else:
+        video_chain = f"[0:v]{video_vf}[v];" if video_vf else ""
+        video_options = (["-c:v", "libx264", "-preset", "veryfast", "-crf", "18",
+                          "-pix_fmt", "yuv420p"] if video_vf else ["-c:v", "copy"])
         command = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-nostdin", "-y",
                    "-i", str(source_video), "-i", str(instrumental), "-i", str(voice),
-                   "-filter_complex", f"[1:a]volume={background_volume:.3f}[bg];[bg][2:a]amix=inputs=2:duration=first:normalize=0,alimiter=limit=0.95[a]",
-                   "-map", "0:v:0", "-map", "[a]", "-c:v", "copy", "-c:a", "aac",
+                   "-filter_complex", video_chain + f"[1:a]volume={background_volume:.3f}[bg];[bg][2:a]amix=inputs=2:duration=first:normalize=0,alimiter=limit=0.95[a]",
+                   "-map", "[v]" if video_vf else "0:v:0", "-map", "[a]",
+                   *video_options, "-c:a", "aac",
                    "-t", str(duration), str(destination)]
         failure = "配音视频混音失败："
-    result = subprocess.run(command, capture_output=True, text=True, check=False)
+    try:
+        result = subprocess.run(command, capture_output=True, text=True, check=False,
+                                cwd=destination.parent)
+    finally:
+        if active_watermark:
+            textfile.unlink(missing_ok=True)
     if result.returncode:
         raise RuntimeError(failure + result.stderr[-700:])

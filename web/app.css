@@ -4,3 +4,25 @@
 :root .sidebar>.upload-panel:not(:first-child):not(#azure-panel){order:3}
 :root #azure-panel{order:4}
 .section-head .invalid{color:#ffadad}
+.top-actions{display:flex;align-items:center;gap:12px}
+.settings-page[hidden]{display:none}
+main.settings-open .hero,main.settings-open .layout{display:none}
+.settings-heading{margin:12px 0 24px}
+.settings-heading h1{margin:7px 0;font-size:34px}
+.settings-heading p{color:#93a8b6;font-size:13px}
+.settings-grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(290px,1fr));gap:18px;align-items:start}
+.settings-grid .panel{padding:22px}
+.settings-grid .panel form{display:flex;flex-direction:column;gap:13px}
+.settings-grid #azure-panel{order:1}
+.settings-grid #subtitle-panel{order:2}
+.settings-grid #watermark-panel{order:3}
+.settings-grid .watermark-switch{display:flex;align-items:center;gap:8px}
+.settings-grid .watermark-switch input{width:auto;margin:0}
+main.home-open .layout,main.detail-open .layout{display:block}
+main.home-open .sidebar{display:grid;grid-template-columns:minmax(290px,420px) minmax(320px,1fr);align-items:start;gap:20px}
+main.home-open .workspace{display:none}
+main.detail-open .sidebar{display:none}
+main.detail-open .workspace{display:block}
+.home-open .jobs-panel{min-height:300px}
+.home-open .job-list{display:grid;grid-template-columns:repeat(auto-fit,minmax(210px,1fr))}
+@media(max-width:800px){main.home-open .sidebar{display:flex;flex-direction:column}.home-open .sidebar>.panel{width:100%}}

@@ -22,19 +22,24 @@ from pydantic import BaseModel
 
 from import_media import import_media
 from azure_dubbing import (DEFAULTS as AZURE_DEFAULTS, VOICES as AZURE_VOICES,
-                           apply_video_fit, chinese_voices as azure_chinese_voices,
+                           assemble_elastic_voice_track, chinese_voices as azure_chinese_voices,
                            delete_key as delete_azure_key, get_key as get_azure_key,
+                           get_keys as get_azure_keys, set_keys as set_azure_keys,
                            load_config as load_azure_config, make_voice_track,
-                           render_video, retime_pieces, retimed_segments,
+                           plan_elastic_timeline, render_video,
                            save_config as save_azure_config,
                            validate_config as validate_azure_config,
-                           validate_key as validate_azure_key, set_key as set_azure_key,
+                           validate_key as validate_azure_key,
                            voice_list as azure_voice_list, write_wav)
 from deepseek_translation import (DEFAULTS, MODELS, delete_api_key, get_api_key, load_config,
                                   make_srt, make_bilingual_srt, save_config, set_api_key, translate_group, call_deepseek,
                                   validate_api_key, glossary_candidates, refine_glossary,
                                   GLOSSARY_VERSION, TRANSLATION_VERSION)
 from prepare_translation import make_segments, realign_edits, term_candidates, translation_input
+from watermark import (DEFAULTS as WATERMARK_DEFAULTS, load_config as load_watermark_config,
+                       save_config as save_watermark_config)
+from subtitle_burn import (DEFAULTS as SUBTITLE_DEFAULTS, load_config as load_subtitle_config,
+                           save_config as save_subtitle_config)
 
 ROOT = Path(__file__).resolve().parent
 DATA = ROOT / ".web_data"
@@ -42,6 +47,8 @@ UPLOADS = DATA / "uploads"
 DB = DATA / "jobs.sqlite3"
 DEEPSEEK_CONFIG = DATA / "deepseek_config.json"
 AZURE_CONFIG = DATA / "azure_config.json"
+WATERMARK_CONFIG = DATA / "watermark_config.json"
+SUBTITLE_CONFIG = DATA / "subtitle_config.json"
 WEB = ROOT / "web"
 DATA.mkdir(exist_ok=True)
 UPLOADS.mkdir(exist_ok=True)
@@ -179,16 +186,19 @@ def translate_job(job_id: str):
             update_job(job_id, translation_status="glossary", translation_progress=0,
                        translation_total=len(packet["groups"]), translation_error="")
             candidates = glossary_candidates(packet)
-            auto_terms, usage = refine_glossary(key, config, packet, candidates)
-            merged = packet["glossary"] + [f"{item['en']} = {item['zh']}" for item in auto_terms]
+            subject, auto_terms, usage = refine_glossary(key, config, packet, candidates)
+            merged = [f"{item['en']} = {item['zh']}" for item in auto_terms]
             glossary = {"glossary_version": GLOSSARY_VERSION, "source_sha256": digest,
-                        "model": config["model"], "user_terms": packet["glossary"],
+                        "model": config["model"], "subject": subject,
                         "candidates": candidates, "auto_terms": auto_terms,
                         "merged_terms": merged, "usage": usage}
             glossary_path.write_text(json.dumps(glossary, ensure_ascii=False, indent=2) + "\n",
                                      encoding="utf-8")
         packet["glossary"] = glossary["merged_terms"]
-        glossary_digest = hashlib.sha256(json.dumps(glossary["merged_terms"], ensure_ascii=False).encode("utf-8")).hexdigest()
+        packet["subject"] = glossary["subject"]
+        glossary_digest = hashlib.sha256(json.dumps(
+            {"subject": packet["subject"], "terms": glossary["merged_terms"]},
+            ensure_ascii=False).encode("utf-8")).hexdigest()
         output_path = DATA / f"{job_id}-translation.json"
         output = {"schema_version": 1, "job_id": job_id, "model": config["model"],
                   "translation_version": TRANSLATION_VERSION,
@@ -223,6 +233,18 @@ def translate_job(job_id: str):
         update_job(job_id, translation_status="failed", translation_error=str(exc))
 
 
+def translate_then_dub(job_id: str):
+    try:
+        job = get_job(job_id)
+        if job["status"] != "prepared" or not (DATA / f"{job_id}-translation-input.json").is_file():
+            prepare(job_id)
+        translate_job(job_id)
+        if get_job(job_id)["translation_status"] == "done":
+            dub_job(job_id)
+    except Exception as exc:
+        update_job(job_id, translation_status="failed", translation_error=str(exc))
+
+
 def process(job_id: str):
     try:
         job = get_job(job_id)
@@ -251,6 +273,7 @@ def process(job_id: str):
         if not segment_rows(job_id):
             save_segments(job_id, make_segments(transcript, duration))
         update_job(job_id, stage="review", status="ready")
+        translate_then_dub(job_id)
     except Exception as exc:
         update_job(job_id, status="failed", error=str(exc))
 
@@ -263,12 +286,14 @@ def index():
 @app.get("/api/jobs")
 def list_jobs():
     with connect() as conn:
-        rows = conn.execute("SELECT id,title,filename,status,stage,error,created_at FROM jobs ORDER BY created_at DESC").fetchall()
+        rows = conn.execute("""SELECT id,title,filename,status,stage,error,created_at,
+                               translation_status,dubbing_status
+                               FROM jobs ORDER BY created_at DESC""").fetchall()
     return [dict(row) for row in rows]
 
 
 @app.post("/api/jobs")
-def create_job(file: UploadFile = File(...), title: str = Form(""), subject: str = Form(""), glossary: str = Form("")):
+def create_job(file: UploadFile = File(...), title: str = Form("")):
     filename = Path(file.filename or "video.mp4").name
     if Path(filename).suffix.lower() != ".mp4":
         raise HTTPException(400, "首版仅支持 MP4 视频")
@@ -286,7 +311,7 @@ def create_job(file: UploadFile = File(...), title: str = Form(""), subject: str
         conn.execute("""INSERT INTO jobs
             (id,title,subject,glossary,filename,upload_path,run_path,status,stage,error,created_at,updated_at)
             VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
-                     (job_id, title.strip() or Path(filename).stem, subject.strip(), glossary.strip(),
+                     (job_id, title.strip() or Path(filename).stem, "", "",
                       filename, str(upload), None, "created", "upload", "", timestamp, timestamp))
     return get_job(job_id)
 
@@ -379,6 +404,8 @@ def prepare(job_id: str):
         raise HTTPException(422, f"修订句段对齐失败：{exc}") from exc
     save_segments(job_id, segments)
     packet = translation_input(job, segments)
+    packet["subject"] = ""
+    packet["glossary"] = []
     path = DATA / f"{job_id}-translation-input.json"
     serialized = json.dumps(packet, ensure_ascii=False, indent=2) + "\n"
     if path.is_file() and path.read_text(encoding="utf-8") != serialized:
@@ -426,6 +453,47 @@ class DeepSeekConfigEdit(BaseModel):
     max_tokens: int = DEFAULTS["max_tokens"]
     api_key: str | None = None
     remove_key: bool = False
+
+
+class WatermarkConfigEdit(BaseModel):
+    enabled: bool = WATERMARK_DEFAULTS["enabled"]
+    text: str = WATERMARK_DEFAULTS["text"]
+    position: str = WATERMARK_DEFAULTS["position"]
+    opacity: float = WATERMARK_DEFAULTS["opacity"]
+
+
+@app.get("/api/watermark/config")
+def watermark_config():
+    return load_watermark_config(WATERMARK_CONFIG)
+
+
+@app.put("/api/watermark/config")
+def configure_watermark(edit: WatermarkConfigEdit):
+    try:
+        return save_watermark_config(WATERMARK_CONFIG, edit.model_dump())
+    except ValueError as exc:
+        raise HTTPException(422, str(exc)) from exc
+
+
+class SubtitleConfigEdit(BaseModel):
+    enabled: bool = SUBTITLE_DEFAULTS["enabled"]
+    mode: str = SUBTITLE_DEFAULTS["mode"]
+    font_size: int = SUBTITLE_DEFAULTS["font_size"]
+    margin_bottom: int = SUBTITLE_DEFAULTS["margin_bottom"]
+    outline: int = SUBTITLE_DEFAULTS["outline"]
+
+
+@app.get("/api/subtitles/config")
+def subtitle_config():
+    return load_subtitle_config(SUBTITLE_CONFIG)
+
+
+@app.put("/api/subtitles/config")
+def configure_subtitles(edit: SubtitleConfigEdit):
+    try:
+        return save_subtitle_config(SUBTITLE_CONFIG, edit.model_dump())
+    except ValueError as exc:
+        raise HTTPException(422, str(exc)) from exc
 
 
 @app.get("/api/deepseek/config")
@@ -482,8 +550,8 @@ def test_deepseek():
 @app.post("/api/jobs/{job_id}/translate")
 def start_translation(job_id: str, force: bool = False):
     job = get_job(job_id)
-    if job["status"] != "prepared" or not (DATA / f"{job_id}-translation-input.json").is_file():
-        raise HTTPException(409, "请先生成译前 JSON")
+    if job["status"] not in ("ready", "prepared"):
+        raise HTTPException(409, "请先完成英文转写")
     key = get_api_key()
     if not key:
         raise HTTPException(409, "请先配置 DeepSeek API Key")
@@ -495,7 +563,7 @@ def start_translation(job_id: str, force: bool = False):
         raise HTTPException(409, "翻译正在进行")
     if job["translation_status"] == "done":
         if not force:
-            raise HTTPException(409, "翻译已完成；如需使用新术语流程，请明确选择重新翻译")
+            raise HTTPException(409, "翻译已完成；如需重新分析课程并翻译，请明确选择重新翻译")
         invalidate_dubbing(job_id)
         for suffix in ("glossary.json", "translation.json", "zh.srt", "bilingual.srt"):
             existing = DATA / f"{job_id}-{suffix}"
@@ -504,7 +572,7 @@ def start_translation(job_id: str, force: bool = False):
                 existing.unlink()
         update_job(job_id, translation_progress=0, translation_total=0)
     update_job(job_id, translation_status="queued", translation_error="")
-    executor.submit(translate_job, job_id)
+    executor.submit(translate_then_dub, job_id)
     return get_job(job_id)
 
 
@@ -551,21 +619,23 @@ def download_bilingual_srt(job_id: str):
 class AzureConfigEdit(BaseModel):
     region: str = AZURE_DEFAULTS["region"]
     voice: str = AZURE_DEFAULTS["voice"]
-    base_rate: float = AZURE_DEFAULTS["base_rate"]
+    per_key_concurrency: int = AZURE_DEFAULTS["per_key_concurrency"]
     max_synthesis_adjust: float = AZURE_DEFAULTS["max_synthesis_adjust"]
     max_post_adjust: float = AZURE_DEFAULTS["max_post_adjust"]
     max_global_adjust: float = AZURE_DEFAULTS["max_global_adjust"]
     max_local_adjust: float = AZURE_DEFAULTS["max_local_adjust"]
     max_video_adjust: float = AZURE_DEFAULTS["max_video_adjust"]
     background_volume: float = AZURE_DEFAULTS["background_volume"]
+    api_keys: str | None = None
     api_key: str | None = None
     remove_key: bool = False
 
 
 @app.get("/api/azure/config")
 def azure_config():
-    key = get_azure_key()
-    return {**load_azure_config(AZURE_CONFIG), "api_key_configured": bool(key),
+    keys = get_azure_keys()
+    return {**load_azure_config(AZURE_CONFIG), "api_key_configured": bool(keys),
+            "key_count": len(keys),
             "voices": AZURE_VOICES}
 
 
@@ -574,11 +644,16 @@ def configure_azure(edit: AzureConfigEdit):
     config = edit.model_dump(include=set(AZURE_DEFAULTS))
     try:
         config = validate_azure_config(config)
-        if edit.api_key:
-            validate_azure_key(edit.api_key)
+        new_keys = edit.api_keys or edit.api_key
+        if new_keys:
+            parsed = [line.strip() for line in new_keys.splitlines() if line.strip()]
+            for item in parsed:
+                validate_azure_key(item)
+            if not 1 <= len(set(parsed)) <= 16:
+                raise ValueError("请填写 1–16 把 Azure Speech 密钥")
         save_azure_config(AZURE_CONFIG, config)
-        if edit.api_key:
-            set_azure_key(edit.api_key)
+        if new_keys:
+            set_azure_keys(parsed)
         elif edit.remove_key:
             delete_azure_key()
     except ValueError as exc:
@@ -606,11 +681,14 @@ def test_azure():
 def dub_job(job_id: str):
     try:
         job = get_job(job_id)
-        key = get_azure_key()
+        keys = get_azure_keys()
         config = validate_azure_config(load_azure_config(AZURE_CONFIG))
-        if not key or not config["region"]:
+        watermark_settings = load_watermark_config(WATERMARK_CONFIG)
+        subtitle_settings = load_subtitle_config(SUBTITLE_CONFIG)
+        if not keys or not config["region"]:
             raise RuntimeError("尚未配置 Azure Speech 密钥和区域")
-        validate_azure_key(key)
+        for key in keys:
+            validate_azure_key(key)
         result = translation_result(job_id)
         segments = [item for group in result["groups"] for item in group["segments"]]
         if not segments:
@@ -620,38 +698,49 @@ def dub_job(job_id: str):
         update_job(job_id, dubbing_status="running", dubbing_progress=0,
                    dubbing_total=len(segments), dubbing_error="")
         baseline = {}
-        track, issues, timings = make_voice_track(
-            segments, config, key, DATA / "dubbing" / job_id, duration,
+        cache_dir = DATA / "dubbing" / job_id
+        source_track, _, timings = make_voice_track(
+            segments, config, keys, cache_dir, duration,
             progress=lambda count: update_job(job_id, dubbing_progress=count),
             baseline_info=baseline)
-        retiming, issues = apply_video_fit(segments, timings, issues, duration,
-                                          max_adjust=float(config["max_video_adjust"]))
+        pieces, cues, retiming, issues, output_duration = plan_elastic_timeline(
+            segments, timings, duration, max_adjust=float(config["max_video_adjust"]))
+        track = (source_track if issues else assemble_elastic_voice_track(
+            segments, timings, config, cache_dir, output_duration))
         voice_path = DATA / f"{job_id}-voice.wav"
         write_wav(voice_path, track)
         affected_segments = len({item.get("id") or item.get("kind") for item in issues})
         report = {"job_id": job_id, "voice": config["voice"], "region": config["region"],
                   "segments": len(segments), "issues": issues,
+                  "azure_key_count": len(keys),
+                  "per_key_concurrency": config["per_key_concurrency"],
                   "affected_segments": affected_segments, "timings": timings,
                   "baseline": baseline,
+                  "source_duration_seconds": round(duration, 3),
+                  "output_duration_seconds": round(output_duration, 3),
+                  "watermark": watermark_settings,
+                  "subtitles": subtitle_settings,
                   "retiming": retiming,
                   "policy": {"max_synthesis_adjust": config["max_synthesis_adjust"],
                              "max_post_adjust": config["max_post_adjust"],
                              "max_global_adjust": config["max_global_adjust"],
                              "max_local_adjust": config["max_local_adjust"],
                              "max_video_adjust": config["max_video_adjust"],
-                             "video_retiming": "超时且画面与随后停顿的调速都在设定上限内时，放慢该句并压缩停顿"}}
+                             "video_retiming": "按句段延长画面与背景音，后续配音和字幕同步顺延"}}
         (DATA / f"{job_id}-dubbing-report.json").write_text(
             json.dumps(report, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
         if issues:
             update_job(job_id, dubbing_status="needs_review", dubbing_error=f"{affected_segments} 句存在时长问题，请下载报告并调整中文台词")
             return
-        cues = retimed_segments(segments, retiming)
         (DATA / f"{job_id}-dubbed-zh.srt").write_text(make_srt(cues), encoding="utf-8-sig")
         (DATA / f"{job_id}-dubbed-bilingual.srt").write_text(make_bilingual_srt(cues), encoding="utf-8-sig")
+        burn_path = DATA / f"{job_id}-dubbed-{'bilingual' if subtitle_settings['mode'] == 'bilingual' else 'zh'}.srt"
         render_video(run / "source.mp4", run / "separated" / "instrumental.flac",
-                     voice_path, DATA / f"{job_id}-dubbed.mp4", duration,
+                     voice_path, DATA / f"{job_id}-dubbed.mp4", output_duration,
                      float(config["background_volume"]),
-                     retime_pieces(retiming, duration) if retiming else None)
+                     pieces if retiming else None,
+                     watermark=watermark_settings,
+                     subtitles=subtitle_settings, subtitle_path=burn_path)
         update_job(job_id, dubbing_status="done", dubbing_error="")
     except Exception as exc:
         update_job(job_id, dubbing_status="failed", dubbing_error=str(exc))
@@ -664,12 +753,13 @@ def start_dubbing(job_id: str):
         raise HTTPException(409, "请先完成中文翻译")
     if job["dubbing_status"] in ("queued", "running"):
         raise HTTPException(409, "配音正在进行")
-    key = get_azure_key()
+    keys = get_azure_keys()
     config = load_azure_config(AZURE_CONFIG)
-    if not key or not config["region"]:
+    if not keys or not config["region"]:
         raise HTTPException(409, "请先配置 Azure Speech 密钥和区域")
     try:
-        validate_azure_key(key)
+        for key in keys:
+            validate_azure_key(key)
         validate_azure_config(config)
     except ValueError as exc:
         raise HTTPException(409, str(exc)) from exc

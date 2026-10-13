@@ -10,7 +10,7 @@ import subprocess
 import sys
 import threading
 import uuid
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
@@ -94,6 +94,7 @@ def initialize():
             "dubbing_progress": "INTEGER NOT NULL DEFAULT 0",
             "dubbing_total": "INTEGER NOT NULL DEFAULT 0",
             "dubbing_error": "TEXT NOT NULL DEFAULT ''",
+            "separate_vocals": "INTEGER NOT NULL DEFAULT 1",
         }.items():
             if name not in columns:
                 conn.execute(f"ALTER TABLE jobs ADD COLUMN {name} {definition}")
@@ -183,7 +184,7 @@ def translate_job(job_id: str):
                     and candidate.get("glossary_version") == GLOSSARY_VERSION):
                 glossary = candidate
         if glossary is None:
-            update_job(job_id, translation_status="glossary", translation_progress=0,
+            update_job(job_id, stage="glossary", translation_status="glossary", translation_progress=0,
                        translation_total=len(packet["groups"]), translation_error="")
             candidates = glossary_candidates(packet)
             subject, auto_terms, usage = refine_glossary(key, config, packet, candidates)
@@ -211,24 +212,34 @@ def translate_job(job_id: str):
                     and previous.get("translation_version") == TRANSLATION_VERSION):
                 output = previous
         completed = {group["id"] for group in output["groups"]}
-        update_job(job_id, translation_status="running", translation_progress=len(completed),
+        update_job(job_id, stage="translate", translation_status="running", translation_progress=len(completed),
                    translation_total=len(packet["groups"]), translation_error="")
-        for group in packet["groups"]:
-            if group["id"] in completed:
-                continue
-            translated, usage = translate_group(key, config, packet, group)
-            output["groups"].append({"id": group["id"], "segments": translated, "usage": usage})
-            for key_name in ("prompt_tokens", "completion_tokens", "total_tokens"):
-                output["usage"][key_name] = output["usage"].get(key_name, 0) + usage.get(key_name, 0)
-            output_path.write_text(json.dumps(output, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-            update_job(job_id, translation_progress=len(output["groups"]))
+        pending = [group for group in packet["groups"] if group["id"] not in completed]
+        first_error = None
+        with ThreadPoolExecutor(max_workers=int(config["concurrency"])) as pool:
+            futures = {pool.submit(translate_group, key, config, packet, group): group["id"]
+                       for group in pending}
+            for future in as_completed(futures):
+                try:
+                    translated, usage = future.result()
+                except Exception as exc:
+                    if first_error is None:
+                        first_error = exc
+                    continue
+                output["groups"].append({"id": futures[future], "segments": translated, "usage": usage})
+                for key_name in ("prompt_tokens", "completion_tokens", "total_tokens"):
+                    output["usage"][key_name] = output["usage"].get(key_name, 0) + usage.get(key_name, 0)
+                output_path.write_text(json.dumps(output, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+                update_job(job_id, translation_progress=len(output["groups"]))
+        if first_error is not None:
+            raise first_error
         indexed = {group["id"]: group for group in output["groups"]}
         output["groups"] = [indexed[group["id"]] for group in packet["groups"]]
         items = [item for group in output["groups"] for item in group["segments"]]
         (DATA / f"{job_id}-zh.srt").write_text(make_srt(items), encoding="utf-8-sig")
         (DATA / f"{job_id}-bilingual.srt").write_text(make_bilingual_srt(items), encoding="utf-8-sig")
         output_path.write_text(json.dumps(output, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
-        update_job(job_id, translation_status="done", translation_error="")
+        update_job(job_id, stage="synthesize", translation_status="done", translation_error="")
     except Exception as exc:
         update_job(job_id, translation_status="failed", translation_error=str(exc))
 
@@ -252,18 +263,22 @@ def process(job_id: str):
         log.write_text("", encoding="utf-8")
         update_job(job_id, status="running", stage="import", error="")
         run = import_media(Path(job["upload_path"]), ROOT / "runs")
-        update_job(job_id, run_path=str(run), stage="separate")
-        with log.open("a", encoding="utf-8") as output:
-            result = subprocess.run([sys.executable, str(ROOT / "separate_audio.py"), str(run)],
-                                    cwd=ROOT, stdout=output, stderr=subprocess.STDOUT, check=False)
-        if result.returncode:
-            raise RuntimeError(f"人声分离失败，退出码 {result.returncode}；请查看处理日志")
+        separate = bool(job["separate_vocals"])
+        update_job(job_id, run_path=str(run))
+        if separate:
+            update_job(job_id, stage="separate")
+            with log.open("a", encoding="utf-8") as output:
+                result = subprocess.run([sys.executable, str(ROOT / "separate_audio.py"), str(run)],
+                                        cwd=ROOT, stdout=output, stderr=subprocess.STDOUT, check=False)
+            if result.returncode:
+                raise RuntimeError(f"人声分离失败，退出码 {result.returncode}；请查看处理日志")
         update_job(job_id, stage="transcribe")
-        transcript = run / "transcript_vocals" / "asr_vocals.json"
+        audio_source = "vocals" if separate else "original"
+        transcript = run / f"transcript_{audio_source}" / ("asr_vocals.json" if separate else "asr_audio.json")
         if not transcript.is_file():
             with log.open("a", encoding="utf-8") as output:
                 result = subprocess.run([sys.executable, str(ROOT / "transcribe_demo.py"),
-                                         str(run), "--audio-source", "vocals"],
+                                         str(run), "--audio-source", audio_source],
                                         cwd=ROOT, stdout=output, stderr=subprocess.STDOUT,
                                         check=False)
             if result.returncode or not transcript.is_file():
@@ -293,7 +308,8 @@ def list_jobs():
 
 
 @app.post("/api/jobs")
-def create_job(file: UploadFile = File(...), title: str = Form("")):
+def create_job(file: UploadFile = File(...), title: str = Form(""),
+               separate_vocals: bool = Form(True)):
     filename = Path(file.filename or "video.mp4").name
     if Path(filename).suffix.lower() != ".mp4":
         raise HTTPException(400, "首版仅支持 MP4 视频")
@@ -309,10 +325,11 @@ def create_job(file: UploadFile = File(...), title: str = Form("")):
     timestamp = now()
     with db_lock, connect() as conn:
         conn.execute("""INSERT INTO jobs
-            (id,title,subject,glossary,filename,upload_path,run_path,status,stage,error,created_at,updated_at)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (id,title,subject,glossary,filename,upload_path,run_path,status,stage,error,created_at,updated_at,separate_vocals)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                      (job_id, title.strip() or Path(filename).stem, "", "",
-                      filename, str(upload), None, "created", "upload", "", timestamp, timestamp))
+                      filename, str(upload), None, "created", "upload", "", timestamp, timestamp,
+                      int(separate_vocals)))
     return get_job(job_id)
 
 
@@ -399,7 +416,8 @@ def prepare(job_id: str):
     if not segments:
         raise HTTPException(409, "没有可导出的句段")
     try:
-        realign_edits(segments, Path(job["run_path"]) / "asr_vocals.wav")
+        audio_name = "asr_vocals.wav" if job["separate_vocals"] else "asr_audio.wav"
+        realign_edits(segments, Path(job["run_path"]) / audio_name)
     except Exception as exc:
         raise HTTPException(422, f"修订句段对齐失败：{exc}") from exc
     save_segments(job_id, segments)
@@ -430,8 +448,10 @@ def media(job_id: str, kind: str):
     if not job["run_path"]:
         raise HTTPException(404, "媒体尚未导入")
     run = Path(job["run_path"])
-    names = {"video": "source.mp4", "vocals": "asr_vocals.wav",
-             "instrumental": "separated/instrumental.flac"}
+    names = {"video": "source.mp4",
+             "vocals": "asr_vocals.wav" if job["separate_vocals"] else "asr_audio.wav"}
+    if job["separate_vocals"]:
+        names["instrumental"] = "separated/instrumental.flac"
     if kind not in names:
         raise HTTPException(404)
     path = run / names[kind]
@@ -451,6 +471,7 @@ class DeepSeekConfigEdit(BaseModel):
     model: str = DEFAULTS["model"]
     temperature: float = DEFAULTS["temperature"]
     max_tokens: int = DEFAULTS["max_tokens"]
+    concurrency: int = DEFAULTS["concurrency"]
     api_key: str | None = None
     remove_key: bool = False
 
@@ -512,7 +533,7 @@ def deepseek_config():
 
 @app.put("/api/deepseek/config")
 def configure_deepseek(edit: DeepSeekConfigEdit):
-    config = edit.model_dump(include={"model", "temperature", "max_tokens"})
+    config = edit.model_dump(include=set(DEFAULTS))
     try:
         if edit.api_key:
             validate_api_key(edit.api_key)
@@ -695,7 +716,7 @@ def dub_job(job_id: str):
             raise RuntimeError("没有可配音的中文句段")
         run = Path(job["run_path"])
         duration = float(job["media"]["duration_seconds"])
-        update_job(job_id, dubbing_status="running", dubbing_progress=0,
+        update_job(job_id, stage="synthesize", dubbing_status="running", dubbing_progress=0,
                    dubbing_total=len(segments), dubbing_error="")
         baseline = {}
         cache_dir = DATA / "dubbing" / job_id
@@ -711,6 +732,7 @@ def dub_job(job_id: str):
         write_wav(voice_path, track)
         affected_segments = len({item.get("id") or item.get("kind") for item in issues})
         report = {"job_id": job_id, "voice": config["voice"], "region": config["region"],
+                  "audio_mode": "separated_background" if job["separate_vocals"] else "voice_only",
                   "segments": len(segments), "issues": issues,
                   "azure_key_count": len(keys),
                   "per_key_concurrency": config["per_key_concurrency"],
@@ -726,7 +748,7 @@ def dub_job(job_id: str):
                              "max_global_adjust": config["max_global_adjust"],
                              "max_local_adjust": config["max_local_adjust"],
                              "max_video_adjust": config["max_video_adjust"],
-                             "video_retiming": "按句段延长画面与背景音，后续配音和字幕同步顺延"}}
+                             "video_retiming": "按句段延长画面，背景音（如保留）、配音和字幕同步顺延"}}
         (DATA / f"{job_id}-dubbing-report.json").write_text(
             json.dumps(report, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
         if issues:
@@ -735,13 +757,15 @@ def dub_job(job_id: str):
         (DATA / f"{job_id}-dubbed-zh.srt").write_text(make_srt(cues), encoding="utf-8-sig")
         (DATA / f"{job_id}-dubbed-bilingual.srt").write_text(make_bilingual_srt(cues), encoding="utf-8-sig")
         burn_path = DATA / f"{job_id}-dubbed-{'bilingual' if subtitle_settings['mode'] == 'bilingual' else 'zh'}.srt"
-        render_video(run / "source.mp4", run / "separated" / "instrumental.flac",
+        update_job(job_id, stage="render")
+        instrumental = run / "separated" / "instrumental.flac" if job["separate_vocals"] else None
+        render_video(run / "source.mp4", instrumental,
                      voice_path, DATA / f"{job_id}-dubbed.mp4", output_duration,
                      float(config["background_volume"]),
                      pieces if retiming else None,
                      watermark=watermark_settings,
                      subtitles=subtitle_settings, subtitle_path=burn_path)
-        update_job(job_id, dubbing_status="done", dubbing_error="")
+        update_job(job_id, stage="done", dubbing_status="done", dubbing_error="")
     except Exception as exc:
         update_job(job_id, dubbing_status="failed", dubbing_error=str(exc))
 

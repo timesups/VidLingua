@@ -2,6 +2,8 @@
 
 import json
 import tempfile
+import threading
+import time
 import unittest
 from pathlib import Path
 from unittest.mock import Mock, patch
@@ -11,6 +13,46 @@ import web_app
 
 
 class DeepSeekTranslationTests(unittest.TestCase):
+    def test_configured_parallel_translation_preserves_group_order(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            config_path = root / "deepseek.json"
+            deepseek.save_config(config_path, {**deepseek.DEFAULTS, "concurrency": 2})
+            packet = {"title": "Test", "groups": [{"id": f"g{i}", "segments": [
+                {"id": f"s{i}", "edited_text": f"Line {i}", "start": i,
+                 "end": i + 1, "duration_seconds": 1, "review_flags": []}]} for i in range(3)]}
+            (root / "test-translation-input.json").write_text(json.dumps(packet), encoding="utf-8")
+            lock = threading.Lock()
+            active = peak = 0
+            def translate(_key, _config, _packet, group):
+                nonlocal active, peak
+                with lock:
+                    active += 1
+                    peak = max(peak, active)
+                time.sleep(.04 if group["id"] == "g0" else .01)
+                with lock:
+                    active -= 1
+                source = group["segments"][0]
+                return ([{"id": source["id"], "start": source["start"], "end": source["end"],
+                          "en": source["edited_text"], "zh": "你好", "flags": []}], {"total_tokens": 1})
+            with patch.object(web_app, "DATA", root), patch.object(web_app, "DB", root / "jobs.sqlite3"), \
+                 patch.object(web_app, "DEEPSEEK_CONFIG", config_path), \
+                 patch.object(web_app, "get_api_key", return_value="fake-key"), \
+                 patch.object(web_app, "glossary_candidates", return_value=[]), \
+                 patch.object(web_app, "refine_glossary", return_value=("测试课程", [], {})), \
+                 patch.object(web_app, "translate_group", side_effect=translate):
+                web_app.initialize()
+                with web_app.connect() as conn:
+                    conn.execute("""INSERT INTO jobs
+                        (id,title,subject,glossary,filename,upload_path,run_path,status,stage,error,created_at,updated_at)
+                        VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
+                        ("test", "Test", "", "", "test.mp4", "", None, "prepared", "prepared", "", "", ""))
+                web_app.translate_job("test")
+                self.assertEqual(web_app.get_job("test")["translation_status"], "done")
+            result = json.loads((root / "test-translation.json").read_text(encoding="utf-8"))
+            self.assertEqual(peak, 2)
+            self.assertEqual([group["id"] for group in result["groups"]], ["g0", "g1", "g2"])
+
     def test_invalid_key_is_rejected_before_network(self):
         with self.assertRaisesRegex(ValueError, "非 ASCII"):
             deepseek.validate_api_key("sk-test中文")

@@ -15,7 +15,8 @@ import requests
 API_URL = "https://api.deepseek.com/chat/completions"
 SERVICE = "VidLingua DeepSeek"
 ACCOUNT = "local-api-key"
-DEFAULTS = {"model": "deepseek-flash", "temperature": 0.2, "max_tokens": 4096}
+DEFAULTS = {"model": "deepseek-flash", "temperature": 0.2, "max_tokens": 4096,
+            "concurrency": 1}
 MODELS = {"deepseek-flash", "deepseek-v4-pro"}
 GLOSSARY_VERSION = 2
 TRANSLATION_VERSION = 3
@@ -24,7 +25,8 @@ TRANSLATION_VERSION = 3
 def load_config(path: Path) -> dict:
     if not path.is_file():
         return dict(DEFAULTS)
-    return {**DEFAULTS, **json.loads(path.read_text(encoding="utf-8"))}
+    saved = json.loads(path.read_text(encoding="utf-8"))
+    return {**DEFAULTS, **{name: value for name, value in saved.items() if name in DEFAULTS}}
 
 
 def save_config(path: Path, config: dict) -> None:
@@ -34,6 +36,9 @@ def save_config(path: Path, config: dict) -> None:
         raise ValueError("温度必须在 0–2 之间")
     if not 512 <= config["max_tokens"] <= 8192:
         raise ValueError("最大输出长度必须在 512–8192 之间")
+    concurrency = config["concurrency"]
+    if isinstance(concurrency, bool) or int(concurrency) != concurrency or not 1 <= concurrency <= 8:
+        raise ValueError("DeepSeek 并发数必须在 1–8 之间")
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_suffix(".tmp")
     temporary.write_text(json.dumps(config, ensure_ascii=False, indent=2), encoding="utf-8")

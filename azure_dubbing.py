@@ -516,7 +516,7 @@ def assemble_elastic_voice_track(segments: list[dict], timings: list[dict], conf
 
 
 def _retime_filter(pieces: list[dict], background_volume: float,
-                   video_filter: str | None = None) -> str:
+                   video_filter: str | None = None, keep_background: bool = True) -> str:
     video_parts = []
     audio_parts = []
     video_labels = []
@@ -525,23 +525,26 @@ def _retime_filter(pieces: list[dict], background_volume: float,
         start, end, speed = float(piece["start"]), float(piece["end"]), float(piece["speed"])
         video_parts.append(
             f"[0:v]trim=start={start:.6f}:end={end:.6f},setpts=(PTS-STARTPTS)/{speed:.6f}[v{index}]")
-        audio = f"[1:a]atrim=start={start:.6f}:end={end:.6f},asetpts=PTS-STARTPTS"
-        if abs(speed - 1) >= .001:
-            audio += f",atempo={speed:.6f}"
-        audio_parts.append(f"{audio}[a{index}]")
+        if keep_background:
+            audio = f"[1:a]atrim=start={start:.6f}:end={end:.6f},asetpts=PTS-STARTPTS"
+            if abs(speed - 1) >= .001:
+                audio += f",atempo={speed:.6f}"
+            audio_parts.append(f"{audio}[a{index}]")
         video_labels.append(f"[v{index}]")
-        audio_labels.append(f"[a{index}]")
+        if keep_background:
+            audio_labels.append(f"[a{index}]")
     count = len(pieces)
     video_parts.append(f"{''.join(video_labels)}concat=n={count}:v=1:a=0[{'vbase' if video_filter else 'v'}]")
     if video_filter:
         video_parts.append(f"[vbase]{video_filter}[v]")
-    audio_parts.append(f"{''.join(audio_labels)}concat=n={count}:v=0:a=1[bg]")
-    audio_parts.append(
-        f"[bg]volume={background_volume:.3f}[bgv];[bgv][2:a]amix=inputs=2:duration=first:normalize=0,alimiter=limit=0.95[a]")
+    if keep_background:
+        audio_parts.append(f"{''.join(audio_labels)}concat=n={count}:v=0:a=1[bg]")
+        audio_parts.append(
+            f"[bg]volume={background_volume:.3f}[bgv];[bgv][2:a]amix=inputs=2:duration=first:normalize=0,alimiter=limit=0.95[a]")
     return ";".join(video_parts + audio_parts)
 
 
-def render_video(source_video: Path, instrumental: Path, voice: Path, destination: Path,
+def render_video(source_video: Path, instrumental: Path | None, voice: Path, destination: Path,
                  duration: float, background_volume: float, pieces: list[dict] | None = None,
                  watermark: dict | None = None, subtitles: dict | None = None,
                  subtitle_path: Path | None = None) -> None:
@@ -567,11 +570,17 @@ def render_video(source_video: Path, instrumental: Path, voice: Path, destinatio
         raise
     video_vf = ",".join(filter(None, (subtitle_vf, watermark_vf)))
     retime = bool(pieces) and any(abs(float(piece["speed"]) - 1) >= .001 for piece in pieces)
+    inputs = ["-i", str(source_video)]
+    if instrumental is not None:
+        inputs += ["-i", str(instrumental)]
+    inputs += ["-i", str(voice)]
+    voice_input = "2:a" if instrumental is not None else "1:a"
     if retime:
         command = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-nostdin", "-y",
-                   "-i", str(source_video), "-i", str(instrumental), "-i", str(voice),
-                   "-filter_complex", _retime_filter(pieces, background_volume, video_vf),
-                   "-map", "[v]", "-map", "[a]", "-c:v", "libx264", "-preset", "veryfast",
+                   *inputs, "-filter_complex", _retime_filter(pieces, background_volume, video_vf,
+                                                              instrumental is not None),
+                   "-map", "[v]", "-map", "[a]" if instrumental is not None else voice_input,
+                   "-c:v", "libx264", "-preset", "veryfast",
                    "-crf", "18", "-pix_fmt", "yuv420p", "-c:a", "aac",
                    "-t", str(duration), str(destination)]
         failure = "配音视频调速混音失败："
@@ -579,10 +588,12 @@ def render_video(source_video: Path, instrumental: Path, voice: Path, destinatio
         video_chain = f"[0:v]{video_vf}[v];" if video_vf else ""
         video_options = (["-c:v", "libx264", "-preset", "veryfast", "-crf", "18",
                           "-pix_fmt", "yuv420p"] if video_vf else ["-c:v", "copy"])
+        audio_chain = (f"[1:a]volume={background_volume:.3f}[bg];[bg][2:a]amix=inputs=2:duration=first:normalize=0,alimiter=limit=0.95[a]"
+                       if instrumental is not None else "")
         command = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-nostdin", "-y",
-                   "-i", str(source_video), "-i", str(instrumental), "-i", str(voice),
-                   "-filter_complex", video_chain + f"[1:a]volume={background_volume:.3f}[bg];[bg][2:a]amix=inputs=2:duration=first:normalize=0,alimiter=limit=0.95[a]",
-                   "-map", "[v]" if video_vf else "0:v:0", "-map", "[a]",
+                   *inputs, *(["-filter_complex", video_chain + audio_chain] if video_chain or audio_chain else []),
+                   "-map", "[v]" if video_vf else "0:v:0",
+                   "-map", "[a]" if instrumental is not None else voice_input,
                    *video_options, "-c:a", "aac",
                    "-t", str(duration), str(destination)]
         failure = "配音视频混音失败："

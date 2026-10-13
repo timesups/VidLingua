@@ -18,6 +18,10 @@ main.settings-open .hero,main.settings-open .layout{display:none}
 .settings-grid #watermark-panel{order:3}
 .settings-grid .watermark-switch{display:flex;align-items:center;gap:8px}
 .settings-grid .watermark-switch input{width:auto;margin:0}
+.upload-panel .task-option{display:flex;align-items:center;gap:9px}
+.upload-panel .task-option input{display:inline;width:auto;margin:0;accent-color:#a6f2c5}
+.step.skipped{opacity:.55;border-style:dashed}
+@media(max-width:650px){.steps{grid-template-columns:repeat(3,minmax(0,1fr))}}
 main.home-open .layout,main.detail-open .layout{display:block}
 main.home-open .sidebar{display:grid;grid-template-columns:minmax(290px,420px) minmax(320px,1fr);align-items:start;gap:20px}
 main.home-open .workspace{display:none}

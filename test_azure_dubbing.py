@@ -245,6 +245,32 @@ class AzureDubbingTests(unittest.TestCase):
             azure.render_video(source, bg, voice, output, 2, .55)
             self.assertGreater(output.stat().st_size, 0)
 
+    def test_ffmpeg_replaces_original_audio_without_separation(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source, voice, output = (root / name for name in ("source.mp4", "voice.wav", "dubbed.mp4"))
+            subprocess.run(["ffmpeg", "-hide_banner", "-loglevel", "error", "-y",
+                            "-f", "lavfi", "-i", "color=c=black:s=64x64:r=24:d=2",
+                            "-f", "lavfi", "-i", "sine=frequency=1000:duration=2",
+                            "-c:v", "libx264", "-c:a", "aac", str(source)], check=True)
+            azure.write_wav(voice, np.zeros(2 * azure.SAMPLE_RATE, dtype="<i2"))
+            pieces = [{"start": 0, "end": 1, "speed": .9},
+                      {"start": 1, "end": 2, "speed": 1.125}]
+            azure.render_video(source, None, voice, output, 2, .55, pieces)
+            decoded = root / "audio.pcm"
+            subprocess.run(["ffmpeg", "-hide_banner", "-loglevel", "error", "-y", "-i", str(output),
+                            "-map", "0:a:0", "-f", "s16le", "-ac", "1", "-ar", "24000", str(decoded)],
+                           check=True)
+            self.assertLess(int(np.abs(np.frombuffer(decoded.read_bytes(), dtype="<i2").astype(np.int32)).max()), 100)
+            subtitle = root / "dubbed-zh.srt"
+            subtitle.write_text("1\n00:00:00,000 --> 00:00:01,000\n你好\n", encoding="utf-8-sig")
+            burned = root / "burned.mp4"
+            azure.render_video(source, None, voice, burned, 2, .55,
+                               subtitles={"enabled": True, "mode": "zh", "font_size": 20,
+                                          "margin_bottom": 20, "outline": 2},
+                               subtitle_path=subtitle)
+            self.assertGreater(burned.stat().st_size, 0)
+
     def test_small_slowdown_covers_overrun_without_moving_later_segments(self):
         segments = [
             {"id": "s0002", "start": 6.934, "end": 9.016, "en": "Court", "zh": "球场中心"},

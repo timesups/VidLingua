@@ -103,7 +103,8 @@ def translation_input(job: dict, segments: list[dict]) -> dict:
     return {
         "schema_version": 1, "job_id": job["id"], "title": job["title"],
         "subject": job["subject"], "source_language": "en", "target_language": "zh-CN",
-        "audio_source": "separated_vocals", "glossary": glossary,
+        "audio_source": "separated_vocals" if job.get("separate_vocals", True) else "original_audio",
+        "glossary": glossary,
         "translation_rules": [
             "Return the same segment IDs in the same order.",
             "Translate for natural spoken Mandarin while preserving technical meaning.",

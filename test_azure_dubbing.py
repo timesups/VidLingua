@@ -103,6 +103,23 @@ class AzureDubbingTests(unittest.TestCase):
         self.assertNotIn("fake-key", request.kwargs["data"].decode("utf-8"))
         self.assertEqual(request.kwargs["headers"]["X-Microsoft-OutputFormat"], "riff-24khz-16bit-mono-pcm")
 
+    def test_polyphonic_pronunciation_reaches_ssml_and_cache(self):
+        pronunciation = [{"text": "行", "pinyin": "hang2", "alias": "航"}]
+        standard = azure.ssml("银行", "zh-CN-XiaoxiaoNeural", 1.0, pronunciation)
+        self.assertIn("<phoneme alphabet='sapi' ph='hang 2'>行</phoneme>", standard)
+        flash = azure.ssml("银行", "zh-CN-Xiaochen:DragonHDFlashLatestNeural", 1.0, pronunciation)
+        self.assertIn("<sub alias='航'>行</sub>", flash)
+        self.assertNotIn("prosody", flash)
+        config = {**azure.DEFAULTS}
+        original = {"id": "s1", "zh": "银行"}
+        annotated = {**original, "pronunciations": pronunciation}
+        self.assertNotEqual(azure.clip_cache_key(original, config, 1.0),
+                            azure.clip_cache_key(annotated, config, 1.0))
+        with tempfile.TemporaryDirectory() as directory, \
+             patch.object(azure, "synthesize", return_value=sample_wav(.3)) as synth:
+            azure._ensure_clips([annotated], config, ["fake-key"], Path(directory), 1.0)
+        self.assertEqual(synth.call_args.args[4], pronunciation)
+
     def test_bounded_post_speed_and_overrun_report(self):
         config = {**azure.DEFAULTS, "region": "eastasia"}
         segments = [{"id": "s1", "start": 0.5, "end": 1.5, "zh": "这是一句比较长的中文台词。"},

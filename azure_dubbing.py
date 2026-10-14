@@ -142,10 +142,45 @@ def voice_list(key: str, region: str) -> list[dict]:
     return response.json()
 
 
-def ssml(text: str, voice: str, rate: float) -> str:
+def pronunciation_content(text: str, annotations: list[dict] | None,
+                          use_alias: bool) -> str:
+    valid = {}
+    for item in annotations or []:
+        target, pinyin, alias = item.get("text"), item.get("pinyin"), item.get("alias")
+        if not all(isinstance(value, str) for value in (target, pinyin, alias)):
+            continue
+        if target not in text or not re.fullmatch(r"[\u4e00-\u9fff]{1,8}", target):
+            continue
+        if not re.fullmatch(r"[a-z]+[1-5](?:\s+[a-z]+[1-5])*", pinyin):
+            continue
+        if len(pinyin.split()) != len(target) or not re.fullmatch(r"[\u4e00-\u9fff]{1,8}", alias):
+            continue
+        valid.setdefault(target, item)
+    if not valid:
+        return escape(text)
+    pattern = re.compile("|".join(re.escape(target) for target in sorted(valid, key=len, reverse=True)))
+    parts, offset = [], 0
+    for match in pattern.finditer(text):
+        parts.append(escape(text[offset:match.start()]))
+        item = valid[match.group()]
+        if use_alias:
+            alias = escape(item["alias"], {"'": "&apos;", '"': "&quot;"})
+            parts.append(f"<sub alias='{alias}'>{escape(match.group())}</sub>")
+        else:
+            phonemes = " ".join(re.sub(r"^([a-z]+)([1-5])$", r"\1 \2", syllable)
+                                for syllable in item["pinyin"].split())
+            parts.append(f"<phoneme alphabet='sapi' ph='{phonemes}'>{escape(match.group())}</phoneme>")
+        offset = match.end()
+    parts.append(escape(text[offset:]))
+    return "".join(parts)
+
+
+def ssml(text: str, voice: str, rate: float, annotations: list[dict] | None = None,
+         use_alias: bool = False) -> str:
     if not valid_voice_name(voice):
         raise ValueError("不支持的 Azure 中文音色")
-    content = escape(text)
+    alias = use_alias or ":DragonHDOmni" in voice or ":DragonHDFlash" in voice
+    content = pronunciation_content(text, annotations, alias)
     if not is_hd_voice(voice):
         content = f"<prosody rate='{rate:.3f}'>{content}</prosody>"
     return ("<speak version='1.0' xmlns='http://www.w3.org/2001/10/synthesis' xml:lang='zh-CN'>"
@@ -153,14 +188,20 @@ def ssml(text: str, voice: str, rate: float) -> str:
             "</voice></speak>")
 
 
-def synthesize(key: str, config: dict, text: str, rate: float) -> bytes:
-    response = requests.post(
-        f"https://{config['region']}.tts.speech.microsoft.com/cognitiveservices/v1",
-        headers={"Ocp-Apim-Subscription-Key": validate_key(key),
-                 "Content-Type": "application/ssml+xml; charset=utf-8",
-                 "X-Microsoft-OutputFormat": "riff-24khz-16bit-mono-pcm",
-                 "User-Agent": "VidLingua"},
-        data=ssml(text, config["voice"], rate).encode("utf-8"), timeout=(10, 120))
+def synthesize(key: str, config: dict, text: str, rate: float,
+               annotations: list[dict] | None = None) -> bytes:
+    url = f"https://{config['region']}.tts.speech.microsoft.com/cognitiveservices/v1"
+    headers = {"Ocp-Apim-Subscription-Key": validate_key(key),
+               "Content-Type": "application/ssml+xml; charset=utf-8",
+               "X-Microsoft-OutputFormat": "riff-24khz-16bit-mono-pcm", "User-Agent": "VidLingua"}
+    response = requests.post(url, headers=headers,
+                             data=ssml(text, config["voice"], rate, annotations).encode("utf-8"),
+                             timeout=(10, 120))
+    if (response.status_code == 400 and annotations
+            and ":DragonHDOmni" not in config["voice"] and ":DragonHDFlash" not in config["voice"]):
+        response = requests.post(url, headers=headers,
+                                 data=ssml(text, config["voice"], rate, annotations, use_alias=True).encode("utf-8"),
+                                 timeout=(10, 120))
     if not response.ok:
         raise RuntimeError(f"Azure Speech 合成失败：HTTP {response.status_code}")
     samples = read_wav(response.content)
@@ -213,6 +254,8 @@ def choose_global_baseline(durations: list[float], windows: list[float], config:
 
 def clip_cache_key(segment: dict, config: dict, rate: float) -> str:
     value = [segment["id"], segment["zh"], config["region"], config["voice"], rate]
+    if segment.get("pronunciations"):
+        value.append(segment["pronunciations"])
     return hashlib.sha256(json.dumps(value, ensure_ascii=False).encode("utf-8")).hexdigest()[:16]
 
 
@@ -247,7 +290,9 @@ def _ensure_clips(segments: list[dict], config: dict, keys: list[str], cache_dir
     try:
         for index, (segment, path) in enumerate(pending):
             key_index = index % len(keys)
-            future = executors[key_index].submit(synthesize, keys[key_index], config, segment["zh"], rate)
+            args = (keys[key_index], config, segment["zh"], rate)
+            annotations = segment.get("pronunciations") or []
+            future = executors[key_index].submit(synthesize, *args, annotations) if annotations else executors[key_index].submit(synthesize, *args)
             futures[future] = path
         for future in as_completed(futures):
             futures[future].write_bytes(future.result())

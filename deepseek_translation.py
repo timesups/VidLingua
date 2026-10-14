@@ -20,6 +20,7 @@ DEFAULTS = {"model": "deepseek-flash", "temperature": 0.2, "max_tokens": 4096,
 MODELS = {"deepseek-flash", "deepseek-v4-pro"}
 GLOSSARY_VERSION = 2
 TRANSLATION_VERSION = 3
+CORRECTION_VERSION = 1
 
 
 def load_config(path: Path) -> dict:
@@ -97,9 +98,60 @@ def call_deepseek(api_key: str, config: dict, messages: list[dict]) -> dict:
 
 SYSTEM_PROMPT = """You translate English lecture subtitles into concise, natural spoken Mandarin Chinese.
 Preserve technical meaning, names, software commands, numbers, units, and course terminology. Use the supplied glossary consistently. Do not invent unclear words. Fit each line to its time budget without dropping concepts.
-Return JSON only. Example JSON: {"segments":[{"id":"s0001","zh":"这是一个例子。","uncertain":false}]}.
+For genuinely ambiguous Chinese polyphonic characters or names, add pronunciations with exact text spans, numbered Pinyin, and a same-sounding Chinese homophone alias for speech engines. Example: {"text":"行","pinyin":"hang2","alias":"航"}. Omit obvious readings and never change the written translation to a homophone.
+Return JSON only. Example JSON: {"segments":[{"id":"s0001","zh":"这是一个例子。","uncertain":false,"pronunciations":[]}]}.
 Return exactly one item for every input ID in the same order. If source wording is uncertain, provide the best translation and set uncertain=true.
 Do not include timestamps in the response."""
+
+
+def correct_english_group(api_key: str, config: dict, packet: dict, group: dict,
+                          next_context: str = "") -> tuple[list[dict], dict]:
+    """Correct recognition errors using neighboring lecture context without changing IDs."""
+    expected = [item["id"] for item in group["segments"]]
+    payload = {"course": packet["title"], "previous_context": group["previous_context"],
+               "next_context": next_context,
+               "segments": [{"id": item["id"], "en": item["edited_text"]}
+                            for item in group["segments"]]}
+    messages = [{"role": "system", "content":
+                 "Correct English lecture transcript recognition errors using context. Keep the speaker's meaning, "
+                 "technical terms, names and sentence boundaries. Make only well-supported corrections; do not invent "
+                 "inaudible words, translate, merge, split, or reorder segments. Return JSON only as "
+                 '{"segments":[{"id":"s0001","en":"Corrected English sentence.","uncertain":false}]}. '
+                 "Return every supplied ID exactly once in the same order."},
+                {"role": "user", "content": json.dumps(payload, ensure_ascii=False)}]
+    for attempt in range(2):
+        response = call_deepseek(api_key, config, messages)
+        items = response["content"].get("segments") if isinstance(response["content"], dict) else None
+        if isinstance(items, list) and [item.get("id") for item in items if isinstance(item, dict)] == expected:
+            if all(isinstance(item.get("en"), str) and item["en"].strip() for item in items):
+                return ([{"id": item["id"], "en": " ".join(item["en"].split()),
+                          "uncertain": bool(item.get("uncertain"))} for item in items], response["usage"])
+        if attempt == 0:
+            messages.append({"role": "user", "content": "Return corrected JSON with these IDs in order: "
+                             + ", ".join(expected)})
+    raise RuntimeError(f"组 {group['id']} 的英文校正 ID 或正文不完整")
+
+
+def clean_pronunciations(chinese: str, value: object) -> list[dict]:
+    if not isinstance(value, list):
+        return []
+    cleaned = []
+    for item in value[:12]:
+        if not isinstance(item, dict):
+            continue
+        target, pinyin, alias = item.get("text"), item.get("pinyin"), item.get("alias")
+        if not all(isinstance(part, str) for part in (target, pinyin, alias)):
+            continue
+        target, pinyin, alias = target.strip(), pinyin.strip().lower(), alias.strip()
+        if not target or target not in chinese or len(target) > 8 or not re.fullmatch(r"[\u4e00-\u9fff]+", target):
+            continue
+        if not re.fullmatch(r"[a-z]+[1-5](?:\s+[a-z]+[1-5])*", pinyin):
+            continue
+        if (len(pinyin.split()) != len(target) or alias == target
+                or not re.fullmatch(r"[\u4e00-\u9fff]{1,8}", alias)):
+            continue
+        cleaned.append({"text": target, "pinyin": pinyin, "alias": alias})
+    return cleaned
 
 
 def glossary_candidates(packet: dict, limit: int = 50) -> list[dict]:
@@ -209,7 +261,8 @@ def translate_group(api_key: str, config: dict, packet: dict, group: dict) -> tu
                     if len(re.sub(r"\s", "", chinese)) / max(source["duration_seconds"], 0.1) > 7:
                         flags.append("fast_reading")
                     result.append({"id": item["id"], "start": source["start"], "end": source["end"],
-                                   "en": source["edited_text"], "zh": chinese, "flags": flags})
+                                   "en": source["edited_text"], "zh": chinese, "flags": flags,
+                                   "pronunciations": clean_pronunciations(chinese, item.get("pronunciations"))})
                 return result, response["usage"]
         if attempt == 1:
             raise RuntimeError(f"组 {group['id']} 的译文 ID 或正文不完整")
@@ -231,9 +284,14 @@ def make_srt(items: list[dict]) -> str:
 
 
 def make_bilingual_srt(items: list[dict]) -> str:
-    """Put the source English above its Chinese translation in each timed cue."""
+    """Put Chinese above the source English in each timed cue."""
     return "\n\n".join(
         f"{i}\n{srt_time(item['start'])} --> {srt_time(item['end'])}\n"
-        f"{' '.join(item['en'].split())}\n{' '.join(item['zh'].split())}"
+        f"{' '.join(item['zh'].split())}\n{' '.join(item['en'].split())}"
         for i, item in enumerate(items, 1)
     ) + "\n"
+
+
+def make_english_srt(items: list[dict]) -> str:
+    return "\n\n".join(f"{i}\n{srt_time(item['start'])} --> {srt_time(item['end'])}\n{item['en']}"
+                      for i, item in enumerate(items, 1)) + "\n"

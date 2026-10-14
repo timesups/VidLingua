@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import hashlib
+import copy
 import shutil
 import sqlite3
 import subprocess
@@ -32,9 +33,10 @@ from azure_dubbing import (DEFAULTS as AZURE_DEFAULTS, VOICES as AZURE_VOICES,
                            validate_key as validate_azure_key,
                            voice_list as azure_voice_list, write_wav)
 from deepseek_translation import (DEFAULTS, MODELS, delete_api_key, get_api_key, load_config,
-                                  make_srt, make_bilingual_srt, save_config, set_api_key, translate_group, call_deepseek,
+                                  make_srt, make_bilingual_srt, make_english_srt, save_config, set_api_key,
+                                  translate_group, correct_english_group, call_deepseek,
                                   validate_api_key, glossary_candidates, refine_glossary,
-                                  GLOSSARY_VERSION, TRANSLATION_VERSION)
+                                  GLOSSARY_VERSION, TRANSLATION_VERSION, CORRECTION_VERSION)
 from prepare_translation import make_segments, realign_edits, term_candidates, translation_input
 from watermark import (DEFAULTS as WATERMARK_DEFAULTS, load_config as load_watermark_config,
                        save_config as save_watermark_config)
@@ -99,7 +101,7 @@ def initialize():
             if name not in columns:
                 conn.execute(f"ALTER TABLE jobs ADD COLUMN {name} {definition}")
         conn.execute("UPDATE jobs SET status='interrupted', error='服务重启中断了处理；可点击重试' WHERE status IN ('queued','running')")
-        conn.execute("UPDATE jobs SET translation_status='interrupted', translation_error='服务重启中断了翻译；可重试' WHERE translation_status IN ('queued','glossary','running')")
+        conn.execute("UPDATE jobs SET translation_status='interrupted', translation_error='服务重启中断了翻译；可重试' WHERE translation_status IN ('queued','correcting','glossary','running')")
         conn.execute("UPDATE jobs SET dubbing_status='interrupted', dubbing_error='服务重启中断了配音；可重试' WHERE dubbing_status IN ('queued','running')")
         conn.execute("UPDATE jobs SET translation_error=? WHERE translation_error LIKE '%latin-1%codec%'",
                      ("已保存的 DeepSeek API Key 含非 ASCII 字符，请在左侧重新粘贴平台生成的密钥后重试",))
@@ -153,7 +155,8 @@ def save_segments(job_id: str, segments: list[dict]):
 
 def invalidate_translation(job_id: str):
     invalidate_dubbing(job_id)
-    for suffix in ("translation-input.json", "glossary.json", "translation.json", "zh.srt", "bilingual.srt"):
+    for suffix in ("translation-input.json", "corrected-english.json", "corrected-en.srt",
+                   "glossary.json", "translation.json", "zh.srt", "bilingual.srt"):
         (DATA / f"{job_id}-{suffix}").unlink(missing_ok=True)
     update_job(job_id, translation_status="not_started", translation_progress=0,
                translation_total=0, translation_error="")
@@ -166,6 +169,63 @@ def invalidate_dubbing(job_id: str):
                dubbing_total=0, dubbing_error="")
 
 
+def correct_packet(job_id: str, key: str, config: dict, packet: dict, source_digest: str) -> dict:
+    path = DATA / f"{job_id}-corrected-english.json"
+    result = {"correction_version": CORRECTION_VERSION, "source_sha256": source_digest,
+              "model": config["model"], "groups": [], "usage": {}}
+    if path.is_file():
+        saved = json.loads(path.read_text(encoding="utf-8"))
+        if (saved.get("correction_version") == CORRECTION_VERSION
+                and saved.get("source_sha256") == source_digest
+                and saved.get("model") == config["model"]):
+            result = saved
+    completed = {group["id"] for group in result["groups"]}
+    update_job(job_id, stage="correct", translation_status="correcting",
+               translation_progress=len(completed), translation_total=len(packet["groups"]),
+               translation_error="")
+    pending = [(index, group) for index, group in enumerate(packet["groups"])
+               if group["id"] not in completed]
+    first_error = None
+    with ThreadPoolExecutor(max_workers=int(config["concurrency"])) as pool:
+        futures = {}
+        for index, group in pending:
+            next_context = (packet["groups"][index + 1]["segments"][0]["edited_text"]
+                            if index + 1 < len(packet["groups"]) else "")
+            futures[pool.submit(correct_english_group, key, config, packet, group, next_context)] = group["id"]
+        for future in as_completed(futures):
+            try:
+                corrected, usage = future.result()
+            except Exception as exc:
+                if first_error is None:
+                    first_error = exc
+                continue
+            result["groups"].append({"id": futures[future], "segments": corrected, "usage": usage})
+            for name in ("prompt_tokens", "completion_tokens", "total_tokens"):
+                result["usage"][name] = result["usage"].get(name, 0) + usage.get(name, 0)
+            path.write_text(json.dumps(result, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+            update_job(job_id, translation_progress=len(result["groups"]))
+    if first_error is not None:
+        raise first_error
+    indexed = {group["id"]: group for group in result["groups"]}
+    result["groups"] = [indexed[group["id"]] for group in packet["groups"]]
+    path.write_text(json.dumps(result, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+    corrected_packet = copy.deepcopy(packet)
+    previous = ""
+    srt_items = []
+    for group in corrected_packet["groups"]:
+        group["previous_context"] = previous
+        corrections = {item["id"]: item for item in indexed[group["id"]]["segments"]}
+        for segment in group["segments"]:
+            correction = corrections[segment["id"]]
+            segment["edited_text"] = correction["en"]
+            if correction.get("uncertain") and "correction_uncertain" not in segment["review_flags"]:
+                segment["review_flags"].append("correction_uncertain")
+            srt_items.append({"start": segment["start"], "end": segment["end"], "en": correction["en"]})
+        previous = group["segments"][-1]["edited_text"]
+    (DATA / f"{job_id}-corrected-en.srt").write_text(make_english_srt(srt_items), encoding="utf-8-sig")
+    return corrected_packet
+
+
 def translate_job(job_id: str):
     try:
         key = get_api_key()
@@ -175,7 +235,9 @@ def translate_job(job_id: str):
         packet_bytes = packet_path.read_bytes()
         packet = json.loads(packet_bytes)
         config = load_config(DEEPSEEK_CONFIG)
-        digest = hashlib.sha256(packet_bytes).hexdigest()
+        source_digest = hashlib.sha256(packet_bytes).hexdigest()
+        packet = correct_packet(job_id, key, config, packet, source_digest)
+        digest = hashlib.sha256(json.dumps(packet, ensure_ascii=False, sort_keys=True).encode("utf-8")).hexdigest()
         glossary_path = DATA / f"{job_id}-glossary.json"
         glossary = None
         if glossary_path.is_file():
@@ -350,6 +412,7 @@ def job_detail(job_id: str):
     job["segment_count"] = len(segments)
     job["review_count"] = sum(bool(s["flags"]) and not s["reviewed"] for s in segments)
     job["term_candidates"] = term_candidates(segments)
+    job["english_correction_ready"] = (DATA / f"{job_id}-corrected-en.srt").is_file()
     return job
 
 
@@ -367,7 +430,7 @@ class SegmentEdit(BaseModel):
 @app.patch("/api/jobs/{job_id}/segments/{segment_id}")
 def edit_segment(job_id: str, segment_id: str, edit: SegmentEdit):
     job = get_job(job_id)
-    if job["translation_status"] in ("queued", "glossary", "running"):
+    if job["translation_status"] in ("queued", "correcting", "glossary", "running"):
         raise HTTPException(409, "翻译进行中，完成后再修订英文")
     with db_lock, connect() as conn:
         row = conn.execute("SELECT * FROM segments WHERE job_id=? AND id=?", (job_id, segment_id)).fetchone()
@@ -395,7 +458,7 @@ class JobEdit(BaseModel):
 @app.patch("/api/jobs/{job_id}")
 def edit_job(job_id: str, edit: JobEdit):
     job = get_job(job_id)
-    if job["translation_status"] in ("queued", "glossary", "running"):
+    if job["translation_status"] in ("queued", "correcting", "glossary", "running"):
         raise HTTPException(409, "翻译进行中，完成后再修改课程背景")
     fields = edit.model_dump(exclude_none=True)
     if fields:
@@ -408,7 +471,7 @@ def edit_job(job_id: str, edit: JobEdit):
 @app.post("/api/jobs/{job_id}/prepare-translation")
 def prepare(job_id: str):
     job = get_job(job_id)
-    if job["translation_status"] in ("queued", "glossary", "running"):
+    if job["translation_status"] in ("queued", "correcting", "glossary", "running"):
         raise HTTPException(409, "翻译进行中")
     if job["status"] not in ("ready", "prepared") or not job["run_path"]:
         raise HTTPException(409, "请先完成转写")
@@ -440,6 +503,15 @@ def download_translation(job_id: str):
     if not path.is_file():
         raise HTTPException(404, "请先准备译前包")
     return FileResponse(path, media_type="application/json", filename=f"{job_id}-translation-input.json")
+
+
+@app.get("/api/jobs/{job_id}/corrected-en.srt")
+def download_corrected_english(job_id: str):
+    get_job(job_id)
+    path = DATA / f"{job_id}-corrected-en.srt"
+    if not path.is_file():
+        raise HTTPException(404, "英文校正尚未完成")
+    return FileResponse(path, media_type="text/plain; charset=utf-8", filename=f"{job_id}-corrected-en.srt")
 
 
 @app.get("/api/jobs/{job_id}/media/{kind}")
@@ -580,13 +652,14 @@ def start_translation(job_id: str, force: bool = False):
         validate_api_key(key)
     except ValueError as exc:
         raise HTTPException(409, str(exc)) from exc
-    if job["translation_status"] in ("queued", "glossary", "running"):
+    if job["translation_status"] in ("queued", "correcting", "glossary", "running"):
         raise HTTPException(409, "翻译正在进行")
     if job["translation_status"] == "done":
         if not force:
             raise HTTPException(409, "翻译已完成；如需重新分析课程并翻译，请明确选择重新翻译")
         invalidate_dubbing(job_id)
-        for suffix in ("glossary.json", "translation.json", "zh.srt", "bilingual.srt"):
+        for suffix in ("corrected-english.json", "corrected-en.srt", "glossary.json",
+                       "translation.json", "zh.srt", "bilingual.srt"):
             existing = DATA / f"{job_id}-{suffix}"
             if existing.is_file():
                 shutil.copy2(existing, DATA / f"{job_id}-previous-{suffix}")
@@ -630,10 +703,11 @@ def download_bilingual_srt(job_id: str):
     if job["translation_status"] != "done":
         raise HTTPException(404, "尚无双语字幕")
     path = DATA / f"{job_id}-bilingual.srt"
-    if not path.is_file():
-        result = translation_result(job_id)
-        items = [item for group in result["groups"] for item in group["segments"]]
-        path.write_text(make_bilingual_srt(items), encoding="utf-8-sig")
+    result = translation_result(job_id)
+    items = [item for group in result["groups"] for item in group["segments"]]
+    bilingual = make_bilingual_srt(items)
+    if not path.is_file() or path.read_text(encoding="utf-8-sig") != bilingual:
+        path.write_text(bilingual, encoding="utf-8-sig")
     return FileResponse(path, media_type="text/plain; charset=utf-8", filename=f"{job_id}-bilingual.srt")
 
 
@@ -641,7 +715,6 @@ class AzureConfigEdit(BaseModel):
     region: str = AZURE_DEFAULTS["region"]
     voice: str = AZURE_DEFAULTS["voice"]
     per_key_concurrency: int = AZURE_DEFAULTS["per_key_concurrency"]
-    max_synthesis_adjust: float = AZURE_DEFAULTS["max_synthesis_adjust"]
     max_post_adjust: float = AZURE_DEFAULTS["max_post_adjust"]
     max_global_adjust: float = AZURE_DEFAULTS["max_global_adjust"]
     max_local_adjust: float = AZURE_DEFAULTS["max_local_adjust"]
@@ -655,14 +728,17 @@ class AzureConfigEdit(BaseModel):
 @app.get("/api/azure/config")
 def azure_config():
     keys = get_azure_keys()
-    return {**load_azure_config(AZURE_CONFIG), "api_key_configured": bool(keys),
+    visible_config = load_azure_config(AZURE_CONFIG)
+    visible_config.pop("max_synthesis_adjust", None)
+    return {**visible_config, "api_key_configured": bool(keys),
             "key_count": len(keys),
             "voices": AZURE_VOICES}
 
 
 @app.put("/api/azure/config")
 def configure_azure(edit: AzureConfigEdit):
-    config = edit.model_dump(include=set(AZURE_DEFAULTS))
+    config = {**load_azure_config(AZURE_CONFIG),
+              **edit.model_dump(exclude={"api_keys", "api_key", "remove_key"})}
     try:
         config = validate_azure_config(config)
         new_keys = edit.api_keys or edit.api_key
@@ -858,6 +934,7 @@ def edit_chinese(job_id: str, segment_id: str, edit: ChineseEdit):
         if target is None:
             raise HTTPException(404, "译文句段不存在")
         target["zh"] = chinese
+        target["pronunciations"] = []
         target["user_edited"] = True
         path.write_text(json.dumps(result, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
         (DATA / f"{job_id}-zh.srt").write_text(make_srt(items), encoding="utf-8-sig")

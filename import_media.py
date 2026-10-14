@@ -14,7 +14,9 @@ from pathlib import Path
 
 def run(command: list[str]) -> subprocess.CompletedProcess[str]:
     try:
-        return subprocess.run(command, check=True, capture_output=True, text=True)
+        # FFprobe emits UTF-8 JSON even when the Windows console uses GBK.
+        return subprocess.run(command, check=True, capture_output=True,
+                              text=True, encoding="utf-8", errors="replace")
     except FileNotFoundError as exc:
         raise RuntimeError(f"Required command is unavailable: {command[0]}") from exc
     except subprocess.CalledProcessError as exc:

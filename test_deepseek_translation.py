@@ -26,6 +26,7 @@ class DeepSeekTranslationTests(unittest.TestCase):
             active = peak = 0
             def translate(_key, _config, _packet, group):
                 nonlocal active, peak
+                self.assertTrue(group["segments"][0]["edited_text"].startswith("Corrected "))
                 with lock:
                     active += 1
                     peak = max(peak, active)
@@ -35,11 +36,15 @@ class DeepSeekTranslationTests(unittest.TestCase):
                 source = group["segments"][0]
                 return ([{"id": source["id"], "start": source["start"], "end": source["end"],
                           "en": source["edited_text"], "zh": "你好", "flags": []}], {"total_tokens": 1})
+            def correct(_key, _config, _packet, group, _next):
+                return ([{"id": segment["id"], "en": "Corrected " + segment["edited_text"], "uncertain": False}
+                         for segment in group["segments"]], {})
             with patch.object(web_app, "DATA", root), patch.object(web_app, "DB", root / "jobs.sqlite3"), \
                  patch.object(web_app, "DEEPSEEK_CONFIG", config_path), \
                  patch.object(web_app, "get_api_key", return_value="fake-key"), \
                  patch.object(web_app, "glossary_candidates", return_value=[]), \
                  patch.object(web_app, "refine_glossary", return_value=("测试课程", [], {})), \
+                 patch.object(web_app, "correct_english_group", side_effect=correct), \
                  patch.object(web_app, "translate_group", side_effect=translate):
                 web_app.initialize()
                 with web_app.connect() as conn:
@@ -52,6 +57,7 @@ class DeepSeekTranslationTests(unittest.TestCase):
             result = json.loads((root / "test-translation.json").read_text(encoding="utf-8"))
             self.assertEqual(peak, 2)
             self.assertEqual([group["id"] for group in result["groups"]], ["g0", "g1", "g2"])
+            self.assertIn("Corrected Line 0", (root / "test-corrected-en.srt").read_text(encoding="utf-8-sig"))
 
     def test_invalid_key_is_rejected_before_network(self):
         with self.assertRaisesRegex(ValueError, "非 ASCII"):
@@ -78,6 +84,27 @@ class DeepSeekTranslationTests(unittest.TestCase):
         self.assertEqual(post.call_args.kwargs["json"]["response_format"], {"type": "json_object"})
         self.assertEqual(post.call_args.kwargs["json"]["thinking"], {"type": "disabled"})
         self.assertEqual(post.call_args.kwargs["headers"]["Authorization"], "Bearer fake-key")
+
+    def test_english_correction_uses_context_and_preserves_ids(self):
+        packet = {"title": "Geometry"}
+        group = {"id": "g1", "previous_context": "We use a vertex shader.", "segments": [
+            {"id": "s1", "edited_text": "The shaper has two inputs."}]}
+        response = {"content": {"segments": [
+            {"id": "s1", "en": "The shader has two inputs.", "uncertain": False}]}, "usage": {}}
+        with patch.object(deepseek, "call_deepseek", return_value=response) as call:
+            corrected, _ = deepseek.correct_english_group("key", deepseek.DEFAULTS, packet, group,
+                                                           "Now compile the shader.")
+        self.assertEqual(corrected[0]["en"], "The shader has two inputs.")
+        self.assertIn("Now compile the shader.", call.call_args.args[2][1]["content"])
+        self.assertIn("We use a vertex shader.", call.call_args.args[2][1]["content"])
+
+    def test_pronunciation_annotations_are_validated(self):
+        annotations = deepseek.clean_pronunciations("银行账户", [
+            {"text": "行", "pinyin": "hang2", "alias": "航"},
+            {"text": "银", "pinyin": "yin2", "alias": "银"},
+            {"text": "不在句中", "pinyin": "bu4 zai4 ju4 zhong1", "alias": "这里"},
+        ])
+        self.assertEqual(annotations, [{"text": "行", "pinyin": "hang2", "alias": "航"}])
 
     def test_course_analysis_filters_unrelated_terms(self):
         packet = {"title": "Lecture", "groups": [{"segments": [
@@ -121,10 +148,15 @@ class DeepSeekTranslationTests(unittest.TestCase):
                           "en": source["edited_text"], "zh": "你好。", "flags": []}],
                         {"total_tokens": 10})
 
+            def correct(_key, _config, _packet, group, _next):
+                return ([{"id": segment["id"], "en": segment["edited_text"], "uncertain": False}
+                         for segment in group["segments"]], {})
+
             with patch.object(web_app, "DATA", root), patch.object(web_app, "DB", root / "jobs.sqlite3"), \
                  patch.object(web_app, "get_api_key", return_value="fake-key"), \
                  patch.object(web_app, "glossary_candidates", return_value=[{"en":"laser","count":2,"example":"laser"}]), \
                  patch.object(web_app, "refine_glossary", side_effect=refine), \
+                 patch.object(web_app, "correct_english_group", side_effect=correct), \
                  patch.object(web_app, "translate_group", side_effect=translate):
                 web_app.initialize()
                 with web_app.connect() as conn:
@@ -142,11 +174,11 @@ class DeepSeekTranslationTests(unittest.TestCase):
                 self.assertEqual(json.loads((root / "test-glossary.json").read_text(encoding="utf-8"))["merged_terms"], ["laser = 激光"])
                 self.assertIn("你好。", (root / "test-zh.srt").read_text(encoding="utf-8-sig"))
                 bilingual = root / "test-bilingual.srt"
-                self.assertIn("00:00:01,000 --> 00:00:02,000\nHello\n你好。",
+                self.assertIn("00:00:01,000 --> 00:00:02,000\n你好。\nHello",
                               bilingual.read_text(encoding="utf-8-sig"))
                 bilingual.unlink()
                 web_app.download_bilingual_srt("test")  # Existing translations can be exported too.
-                self.assertEqual(bilingual.read_text(encoding="utf-8-sig").count("\nHello\n你好。"), 2)
+                self.assertEqual(bilingual.read_text(encoding="utf-8-sig").count("\n你好。\nHello"), 2)
                 with patch.object(web_app.executor, "submit", return_value=None):
                     restarted = web_app.start_translation("test", force=True)
                 self.assertEqual(restarted["translation_status"], "queued")

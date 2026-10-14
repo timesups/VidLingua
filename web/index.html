@@ -4,7 +4,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width,initial-scale=1">
   <title>VidLingua · 课程中文配音工作台</title>
-  <link rel="stylesheet" href="/static/app.css?v=7">
+  <link rel="stylesheet" href="/static/app.css?v=9">
 </head>
 <body>
   <header class="topbar"><div class="brand"><span class="brand-mark">V</span><div><strong>VidLingua</strong><small>课程中文配音工作台</small></div></div><div class="top-actions"><span class="topnote">本地处理 · 自动翻译与配音</span><button type="button" id="home-toggle" class="ghost" hidden>← 任务列表</button><button type="button" id="settings-toggle" class="ghost" aria-expanded="false">⚙ 设置</button></div></header>
@@ -13,6 +13,6 @@
     <section class="layout"><aside class="sidebar"><div class="panel upload-panel"><div class="section-head"><h2>新建任务</h2><span>MP4</span></div><form id="upload-form"><label class="drop" id="drop"><input id="file" name="file" type="file" accept="video/mp4,.mp4" required><span class="upload-icon">↑</span><strong id="file-label">选择或拖入课程视频</strong><small>视频仅保存在本机工作目录</small></label><label>课程名称<input name="title" placeholder="例如：计算机视觉入门"></label><label class="task-option"><input name="separate_vocals" type="checkbox" value="true" checked> 分离人声并保留背景音</label><small class="setting-hint">关闭后直接识别原音轨；成片只保留中文配音，不混入原声。</small><small class="setting-hint">学科背景和术语表将在翻译前自动分析生成。</small><button class="primary full" type="submit" id="create-btn">导入并开始处理 <span>→</span></button></form></div><div class="panel jobs-panel"><div class="section-head"><h2>任务列表</h2><span id="job-total">0 项</span></div><div id="job-list" class="job-list"></div></div><div class="panel upload-panel"><div class="section-head"><h2>DeepSeek 配置</h2><span id="deepseek-state">未配置</span></div><form id="deepseek-form"><label>API Key<input id="deepseek-key" type="password" autocomplete="new-password" placeholder="留空则保持现有密钥"></label><small class="setting-hint">密钥保存在本机 Windows 凭据管理器，不回传到页面。</small><label>模型<select id="deepseek-model"><option value="deepseek-flash">deepseek-flash</option><option value="deepseek-v4-pro">deepseek-v4-pro</option></select></label><label>温度<input id="deepseek-temperature" type="number" min="0" max="2" step="0.1" value="0.2"></label><label>最大输出 Token<input id="deepseek-max-tokens" type="number" min="512" max="8192" step="1" value="4096"></label><label>翻译组并发数<input id="deepseek-concurrency" type="number" min="1" max="8" step="1" value="1"></label><small class="setting-hint">术语分析完成后，最多同时翻译此数量的字幕组。</small><div class="setting-actions"><button type="submit" class="primary">保存配置</button><button type="button" class="ghost" id="deepseek-test">测试连接</button></div><button type="button" class="link-button" id="deepseek-remove">移除已保存密钥</button><small class="setting-hint">测试连接会向 DeepSeek 发送一个极短请求。翻译任务会发送英文句段、背景和术语表。</small></form></div></aside>
     <div class="workspace" id="workspace"></div></section>
   </main>
-  <script src="/static/app.js?v=7"></script>
+  <script src="/static/app.js?v=9"></script>
 </body>
 </html>

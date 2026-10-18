@@ -9,7 +9,7 @@ import sys
 from pathlib import Path
 
 
-PROJECT_ROOT = Path(__file__).resolve().parent
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
 
 def main() -> int:
@@ -46,6 +46,7 @@ def main() -> int:
         "--compute_type", "float16",
         "--batch_size", str(args.batch_size),
         "--vad_method", "silero",
+        "--chunk_size", "15",
         "--output_dir", str(job_dir / ("transcript" if args.audio_source == "auto" else f"transcript_{selected_source}")),
         "--output_format", "all",
         "--verbose", "False",

@@ -279,17 +279,19 @@ def srt_time(seconds: float) -> str:
 
 
 def make_srt(items: list[dict]) -> str:
+    voiced = [item for item in items if str(item.get("zh") or "").strip()]
     return "\n\n".join(f"{i}\n{srt_time(item['start'])} --> {srt_time(item['end'])}\n{item['zh']}"
-                      for i, item in enumerate(items, 1)) + "\n"
+                      for i, item in enumerate(voiced, 1)) + ("\n" if voiced else "")
 
 
 def make_bilingual_srt(items: list[dict]) -> str:
     """Put Chinese above the source English in each timed cue."""
+    voiced = [item for item in items if str(item.get("zh") or "").strip()]
     return "\n\n".join(
         f"{i}\n{srt_time(item['start'])} --> {srt_time(item['end'])}\n"
         f"{' '.join(item['zh'].split())}\n{' '.join(item['en'].split())}"
-        for i, item in enumerate(items, 1)
-    ) + "\n"
+        for i, item in enumerate(voiced, 1)
+    ) + ("\n" if voiced else "")
 
 
 def make_english_srt(items: list[dict]) -> str:

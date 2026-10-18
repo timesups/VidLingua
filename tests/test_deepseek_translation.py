@@ -8,8 +8,8 @@ import unittest
 from pathlib import Path
 from unittest.mock import Mock, patch
 
-import deepseek_translation as deepseek
-import web_app
+from vidlingua.providers import deepseek
+from vidlingua import web_app
 
 
 class DeepSeekTranslationTests(unittest.TestCase):

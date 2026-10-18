@@ -1,13 +1,14 @@
 """Exercise the local API with demo2.mp4. Run while web_app is serving."""
 
 import json
+import os
 import time
 from pathlib import Path
 
 import requests
 
-base = "http://127.0.0.1:8000"
-video = Path(__file__).with_name("demo2.mp4")
+base = os.environ.get("VIDLINGUA_URL", "http://127.0.0.1:8001").rstrip("/")
+video = Path(__file__).resolve().parent.parent / "samples" / "demo2.mp4"
 with video.open("rb") as source:
     response = requests.post(base + "/api/jobs", files={"file": (video.name, source, "video/mp4")},
                              data={"title": "demo2 网页验收", "subject": "单人课程视频", "glossary": "laser = 激光"})

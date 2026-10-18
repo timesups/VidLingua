@@ -3,7 +3,7 @@
 import sys
 import unittest
 
-from import_media import run
+from vidlingua.pipeline.import_media import run
 
 
 class ImportMediaTests(unittest.TestCase):

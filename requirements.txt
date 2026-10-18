@@ -4,3 +4,4 @@ python-multipart==0.0.32
 keyring==25.7.0
 requests==2.34.2
 numpy>=2.0,<3
+yt-dlp[default]>=2026.8.19

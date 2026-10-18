@@ -32,5 +32,71 @@ main.home-open .workspace{display:none}
 main.detail-open .sidebar{display:none}
 main.detail-open .workspace{display:block}
 .home-open .jobs-panel{min-height:300px}
-.home-open .job-list{display:grid;grid-template-columns:repeat(auto-fit,minmax(210px,1fr))}
+.home-open .jobs-panel{min-width:0}
+.job-toolbar{display:grid;grid-template-columns:minmax(180px,1fr) 132px auto auto;gap:8px;align-items:center}
+.job-toolbar input,.job-toolbar select{width:100%;min-width:0;padding:10px 11px;background:#0c1520;border:1px solid #2d4051;border-radius:8px;color:#e9edf5;font-size:12px}
+.job-toolbar input:focus,.job-toolbar select:focus{outline:1px solid #90dab1}
+.job-toolbar .ghost{white-space:nowrap}
+.job-selection-count{margin:11px 0;color:#8ca4af;font-size:11px}
+.job-table-scroll{overflow:auto;border:1px solid #2b3d4d;border-radius:10px}
+.job-table{width:100%;min-width:690px;border-collapse:collapse;text-align:left;font-size:12px}
+.job-table th,.job-table td{padding:11px 10px;border-bottom:1px solid #263746;vertical-align:middle}
+.job-table th{position:sticky;top:0;background:#182735;color:#9eb2bf;font-size:11px;font-weight:600}
+.job-table tr:last-child td{border-bottom:0}
+.job-table .job-row:hover{background:#192a35}
+.job-table .job-row.active{background:#1b302b}
+.job-table th:first-child,.job-table td:first-child{width:36px}
+.job-table input[type=checkbox]{width:16px;height:16px;accent-color:#a6f2c5}
+.job-table td:nth-child(2){min-width:220px;max-width:360px}
+.job-title{border:0;background:none;color:#e9edf5;padding:0;font-weight:700;text-align:left;max-width:100%;overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
+.job-title:hover{color:#a6f2c5}
+.job-table td small{display:block;color:#8094a2;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;max-width:320px;margin-top:4px}
+.job-state{white-space:nowrap;color:#c6d8e0}
+.job-state.is-active{color:#a6f2c5}
+.job-table td:last-child{text-align:right;min-width:64px;white-space:nowrap}
+.job-table td:last-child .ghost{padding:6px 10px;white-space:nowrap}
+.job-empty{padding:18px 0}
+.ghost.danger{color:#ffb7bb;border-color:#69434d}
+.ghost.danger:hover{background:#3b2529}
+@media(max-width:1120px){.job-toolbar{grid-template-columns:minmax(180px,1fr) 132px}.job-toolbar button{width:100%}}
 @media(max-width:800px){main.home-open .sidebar{display:flex;flex-direction:column}.home-open .sidebar>.panel{width:100%}}
+.progress-dashboard{padding:0 25px 16px;border-bottom:1px solid #263746}
+.progress-heading{display:flex;justify-content:space-between;align-items:center;gap:18px;margin:10px 0 7px;color:#aebfc9;font-size:12px}
+.progress-heading strong{color:#a6f2c5;font-size:12px;font-weight:600;text-align:right}
+.progress-dashboard progress{display:block;width:100%;height:12px;border:0;border-radius:99px;overflow:hidden;accent-color:#a6f2c5;background:#22313e}
+.progress-dashboard progress::-webkit-progress-bar{background:#22313e;border-radius:99px}
+.progress-dashboard progress::-webkit-progress-value{background:#a6f2c5;border-radius:99px}
+.job-log{border-top:1px solid #263746;padding:18px 25px 24px}
+.job-log h3{margin:0;font-size:14px;color:#e9edf5}
+.job-log pre{margin:12px 0 0;max-height:300px;overflow:auto;padding:14px;border-radius:10px;background:#09121b;color:#afc4ca;font:11px/1.6 Consolas,monospace;white-space:pre-wrap;overflow-wrap:anywhere}
+.key-results{display:grid;gap:7px;color:#9fb2be;font-size:11px}
+.key-results strong{color:#d9e9df}
+.key-result{border:1px solid #314757;border-radius:8px;padding:9px 11px;background:#0c1721}
+.key-result.good{color:#a6f2c5;border-color:#325f4a}
+.key-result.bad{color:#ffb8bd;border-color:#765057}
+@media(max-width:650px){.progress-dashboard,.job-log{padding-left:14px;padding-right:14px}.progress-heading{align-items:flex-start}}
+.dubbing-review-list{display:grid;gap:12px;max-height:780px;overflow:auto;padding:2px 4px 4px 0}
+.dubbing-issue{border:1px solid #385162;border-radius:11px;background:#122130;padding:15px}
+.issue-heading,.issue-actions{display:flex;justify-content:space-between;align-items:center;gap:12px}
+.issue-heading strong{font-size:13px;color:#dcece6}.issue-heading span{font-size:11px;color:#f1c196}
+.issue-subtitles{display:grid;grid-template-columns:1fr 1fr;gap:12px;margin:13px 0}
+.issue-subtitles>div{padding:10px 12px;background:#0b1822;border-radius:8px;border:1px solid #2b414e}
+.issue-subtitles small{color:#8caeac}.issue-subtitles p{font-size:14px;color:#e7f2ef;margin:5px 0 0}
+.issue-audio{display:flex;align-items:center;gap:10px;flex-wrap:wrap;margin:10px 0;color:#a9c0c5;font-size:11px}
+.issue-audio audio{height:36px;max-width:100%;flex:1;min-width:240px}
+.issue-edit{display:block;color:#9fb7bd;font-size:11px}.issue-edit textarea{min-height:70px;margin-top:7px}
+.issue-actions{margin-top:9px}.issue-actions small{max-width:80%;color:#bdad9d}.issue-actions button{white-space:nowrap}
+.review-note{padding:10px 12px;border:1px solid #7f6741;background:#32291f;border-radius:8px;color:#f2cea0!important}
+.retime-details{margin-top:16px;border-top:1px solid #2a3c48;padding-top:13px}.retime-details summary{cursor:pointer;color:#aacabd;font-size:12px}
+.finished-preview{margin-bottom:17px}
+.finished-preview video{display:block;width:100%;max-height:min(68vh,720px);aspect-ratio:16/9;background:#000;border-radius:9px}
+.finished-preview p{margin:10px 0 0}
+.source-tabs{display:grid;grid-template-columns:1fr 1fr;gap:6px;padding:4px;border:1px solid #2d4051;border-radius:10px;background:#0c1520}
+.source-tabs button{border:0;border-radius:7px;background:transparent;color:#8fa4b2;padding:9px 5px;font-size:11px;font-weight:700}
+.source-tabs button.selected{background:#204236;color:#c2ffdc}
+.upload-panel [hidden]{display:none!important}
+#youtube-panel .setting-hint{display:block;margin-top:7px}
+.preview-subtitles-switch{display:inline-flex;align-items:center;gap:6px;color:#c2e8d0;font-size:12px;white-space:nowrap;cursor:pointer}
+.preview-subtitles-switch input{accent-color:#a6f2c5;width:15px;height:15px;margin:0}
+#video::cue{color:#fff;background:rgba(0,0,0,.76);font-family:"Microsoft YaHei",system-ui,sans-serif}
+@media(max-width:700px){.issue-subtitles{grid-template-columns:1fr}.issue-actions{align-items:flex-start;flex-direction:column}.issue-actions small{max-width:100%}}

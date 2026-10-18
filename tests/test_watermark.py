@@ -7,8 +7,8 @@ from pathlib import Path
 from fastapi import HTTPException
 from unittest.mock import patch
 
-import watermark
-import web_app
+from vidlingua.rendering import watermark
+from vidlingua import web_app
 
 
 class WatermarkTests(unittest.TestCase):

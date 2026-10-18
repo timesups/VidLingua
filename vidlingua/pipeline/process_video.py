@@ -7,11 +7,11 @@ import subprocess
 import sys
 from pathlib import Path
 
-from import_media import import_media
-from separate_audio import separate
+from .import_media import import_media
+from .separate_audio import separate
 
 
-PROJECT_ROOT = Path(__file__).resolve().parent
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
 
 
 def main() -> int:
@@ -26,7 +26,7 @@ def main() -> int:
         print(f"Imported: {job_dir}", flush=True)
         if args.separate_vocals:
             print(f"Separated ASR audio: {separate(job_dir)}", flush=True)
-        command = [sys.executable, str(PROJECT_ROOT / "transcribe_demo.py"), str(job_dir)]
+        command = [sys.executable, "-m", "vidlingua.pipeline.transcribe", str(job_dir)]
         if args.separate_vocals:
             command += ["--audio-source", "vocals"]
         elif (job_dir / "asr_vocals.wav").is_file():
@@ -36,7 +36,7 @@ def main() -> int:
             return result.returncode
         if args.compare_original and args.separate_vocals:
             result = subprocess.run([
-                sys.executable, str(PROJECT_ROOT / "transcribe_demo.py"),
+                sys.executable, "-m", "vidlingua.pipeline.transcribe",
                 str(job_dir), "--audio-source", "original",
             ], check=False)
             if result.returncode:

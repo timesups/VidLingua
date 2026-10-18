@@ -7,8 +7,8 @@ from unittest.mock import patch
 
 from fastapi import HTTPException
 
-import subtitle_burn
-import web_app
+from vidlingua.rendering import subtitles as subtitle_burn
+from vidlingua import web_app
 
 
 class SubtitleBurnTests(unittest.TestCase):

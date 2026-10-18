@@ -16,7 +16,7 @@ def save_config(path: Path, value: dict) -> dict:
     config = {**DEFAULTS, **value}
     if config["mode"] not in {"zh", "bilingual"}:
         raise ValueError("字幕模式须为中文或双语")
-    for name, low, high in (("font_size", 14, 60), ("margin_bottom", 0, 200),
+    for name, low, high in (("font_size", 5, 60), ("margin_bottom", 0, 200),
                             ("outline", 0, 5)):
         item = config[name]
         if isinstance(item, bool) or not isinstance(item, int) or not low <= item <= high:

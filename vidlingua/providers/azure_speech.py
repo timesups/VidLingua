@@ -734,6 +734,14 @@ def render_video(source_video: Path, instrumental: Path | None, voice: Path, des
                 "-map", "[a]" if instrumental is not None else voice_input]
         failure = "配音视频混音失败："
 
+    # Windows limits a process command line to about 32 KiB. A long lesson can
+    # create hundreds of trim/atempo filters, so pass the graph through a file.
+    filter_script = None
+    if filters and filters[0] == "-filter_complex" and len(filters[1]) > 12000:
+        filter_script = destination.with_name(f".{destination.stem}.{uuid.uuid4().hex[:8]}.ffgraph")
+        filter_script.write_text(filters[1], encoding="utf-8")
+        filters = ["-filter_complex_script", str(filter_script)]
+
     def log(message: str) -> None:
         if log_path is not None:
             with log_path.open("a", encoding="utf-8") as output:
@@ -751,6 +759,8 @@ def render_video(source_video: Path, instrumental: Path | None, voice: Path, des
                 result = subprocess.run(command, capture_output=True, text=True, check=False,
                                         cwd=destination.parent)
             except FileNotFoundError as exc:
+                if getattr(exc, "winerror", None) == 206:
+                    raise RuntimeError("FFmpeg 命令行超过 Windows 长度限制") from exc
                 raise RuntimeError("未找到 FFmpeg，无法合成视频") from exc
             if result.returncode == 0 and temporary.is_file() and temporary.stat().st_size > 0:
                 temporary.replace(destination)
@@ -762,6 +772,8 @@ def render_video(source_video: Path, instrumental: Path | None, voice: Path, des
                 log("NVENC 合成失败，改用 CPU 编码重试")
     finally:
         temporary.unlink(missing_ok=True)
+        if filter_script is not None:
+            filter_script.unlink(missing_ok=True)
         if active_watermark:
             textfile.unlink(missing_ok=True)
     raise RuntimeError(failure + " | ".join(errors))

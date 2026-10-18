@@ -1,13 +1,18 @@
 const azurePanel = document.createElement("div");
 azurePanel.className = "panel upload-panel";
 azurePanel.id = "azure-panel";
-azurePanel.innerHTML = `<div class="section-head"><h2>Azure 中文配音</h2><span id="azure-state">未配置</span></div><form id="azure-form"><label>Speech 密钥池（每行一把）<textarea id="azure-keys" rows="4" autocomplete="off" placeholder="每行粘贴一把密钥；留空保持现有密钥"></textarea></label><small class="setting-hint" id="azure-key-count">尚未保存密钥</small><label>每把密钥最大并发请求<input id="azure-per-key-concurrency" type="number" min="1" max="8" step="1" value="1"></label><small class="setting-hint">密钥保存在本机 Windows 凭据管理器。</small><label>资源区域<input id="azure-region" placeholder="例如 eastasia"></label><label>中文音色<select id="azure-voice"></select></label><label id="azure-temperature-row">HD 表现温度（越低越平稳）<input id="azure-temperature" type="number" min="0.3" max="1" step="0.05" value="0.4"></label><small class="setting-hint" id="azure-voice-note">保存密钥后读取当前区域的中文音色。</small><label>全片自动基准提速上限<input id="azure-global-adjust" type="number" min="0" max="0.30" step="0.01" value="0.08"></label><label>逐句相对基准提速上限<input id="azure-local-adjust" type="number" min="0" max="0.25" step="0.01" value="0.05"></label><label>音频后处理总上限<input id="azure-post-adjust" type="number" min="0" max="0.75" step="0.01" value="0.15"></label><label>单句画面调速上限<input id="azure-video-adjust" type="number" min="0" max="0.50" step="0.01" value="0.18"></label><small class="setting-hint">可选上限：全片基准 0.30、逐句微调 0.25、音频后处理 0.75、画面调速 0.50。配音长于这段画面时放慢，短于画面时加快，幅度都不超过画面调速上限。</small><label>背景音音量<input id="azure-background-volume" type="number" min="0" max="1" step="0.05" value="0.55"></label><div class="setting-actions"><button type="submit" class="primary">保存配置</button><button type="button" class="ghost" id="azure-test">刷新区域音色</button></div><button type="button" class="ghost" id="azure-check">检测已保存密钥</button><div id="azure-key-results" class="key-results" aria-live="polite"></div><button type="button" class="link-button" id="azure-remove">移除已保存密钥</button><small class="setting-hint">刷新音色只读取 Azure 列表；开始配音后才发送中文台词。</small></form>`;
+azurePanel.innerHTML = `<div class="section-head"><h2>Azure 语音模型</h2><span id="azure-state">未配置</span></div><form id="azure-form"><label>Speech 密钥池（每行一把）<textarea id="azure-keys" rows="4" autocomplete="off" placeholder="每行粘贴一把密钥；留空保持现有密钥"></textarea></label><small class="setting-hint" id="azure-key-count">尚未保存密钥</small><label>每把密钥最大并发请求<input id="azure-per-key-concurrency" type="number" min="1" max="8" step="1" value="1"></label><small class="setting-hint">密钥保存在本机 Windows 凭据管理器。</small><label>资源区域<input id="azure-region" placeholder="例如 eastasia"></label><label>中文音色<select id="azure-voice"></select></label><label id="azure-temperature-row">HD 表现温度（越低越平稳）<input id="azure-temperature" type="number" min="0.3" max="1" step="0.05" value="0.4"></label><small class="setting-hint" id="azure-voice-note">保存密钥后读取当前区域的中文音色。</small><div class="setting-actions"><button type="submit" class="primary">保存语音模型</button><button type="button" class="ghost" id="azure-test">刷新区域音色</button></div><button type="button" class="ghost" id="azure-check">检测已保存密钥</button><div id="azure-key-results" class="key-results" aria-live="polite"></div><button type="button" class="link-button" id="azure-remove">移除已保存密钥</button><small class="setting-hint">刷新音色只读取 Azure 列表；开始配音后才发送中文台词。</small></form>`;
 $("#settings-grid").appendChild(azurePanel);
 const doubaoPanel = document.createElement("div");
 doubaoPanel.className = "panel upload-panel";
 doubaoPanel.id = "doubao-panel";
-doubaoPanel.innerHTML = `<div class="section-head"><h2>豆包语音</h2><span id="doubao-state">未配置</span></div><form id="doubao-form"><label>API Key<input id="doubao-key" type="password" autocomplete="new-password" placeholder="留空则保持现有密钥"></label><small class="setting-hint">使用火山引擎新版控制台的 API Key，保存在本机 Windows 凭据管理器。</small><label>资源 ID<select id="doubao-resource"></select></label><label>发音人<input id="doubao-speaker" list="doubao-speakers" spellcheck="false" placeholder="例如 zh_female_vv_uranus_bigtts"></label><datalist id="doubao-speakers"></datalist><small class="setting-hint" id="doubao-voice-note">2.0 音色需搭配 seed-tts-2.0。也可以填写已授权的自定义发音人 ID。</small><label>最大并发请求<input id="doubao-concurrency" type="number" min="1" max="8" step="1" value="1"></label><small class="setting-hint">画面调速、音频后处理和背景音音量沿用 Azure 配音里的同一组上限。新建任务时选择配音引擎。</small><div class="setting-actions"><button type="submit" class="primary">保存配置</button><button type="button" class="ghost" id="doubao-test">测试连接</button></div><button type="button" class="link-button" id="doubao-remove">移除已保存密钥</button><small class="setting-hint">测试连接会用当前发音人合成一句“测试。”。</small></form>`;
+doubaoPanel.innerHTML = `<div class="section-head"><h2>豆包语音模型</h2><span id="doubao-state">未配置</span></div><form id="doubao-form"><label>API Key<input id="doubao-key" type="password" autocomplete="new-password" placeholder="留空则保持现有密钥"></label><small class="setting-hint">使用火山引擎新版控制台的 API Key，保存在本机 Windows 凭据管理器。</small><label>资源 ID<select id="doubao-resource"></select></label><label>发音人<input id="doubao-speaker" list="doubao-speakers" spellcheck="false" placeholder="例如 zh_female_vv_uranus_bigtts"></label><datalist id="doubao-speakers"></datalist><small class="setting-hint" id="doubao-voice-note">2.0 音色需搭配 seed-tts-2.0。也可以填写已授权的自定义发音人 ID。</small><label>最大并发请求<input id="doubao-concurrency" type="number" min="1" max="8" step="1" value="1"></label><small class="setting-hint">速度与时间轴参数在下方独立设置，对 Azure 和豆包任务都生效。</small><div class="setting-actions"><button type="submit" class="primary">保存语音模型</button><button type="button" class="ghost" id="doubao-test">测试连接</button></div><button type="button" class="link-button" id="doubao-remove">移除已保存密钥</button><small class="setting-hint">测试连接会用当前发音人合成一句“测试。”。</small></form>`;
 $("#settings-grid").appendChild(doubaoPanel);
+const timingPanel = document.createElement("div");
+timingPanel.className = "panel upload-panel";
+timingPanel.id = "timing-panel";
+timingPanel.innerHTML = `<div class="section-head"><h2>速度与时间轴</h2><span>Azure / 豆包共用</span></div><form id="timing-form"><small class="setting-hint">基于全片语音时长确定统一基准，再逐句微调。剩余时长差由画面调速吸收；豆包语音不使用服务端合成提速。</small><label>全片自动基准提速上限<input id="azure-global-adjust" type="number" min="0" max="0.30" step="0.01" value="0.08"></label><label>逐句相对基准提速上限<input id="azure-local-adjust" type="number" min="0" max="0.25" step="0.01" value="0.05"></label><label>音频后处理总上限<input id="azure-post-adjust" type="number" min="0" max="0.75" step="0.01" value="0.15"></label><label>单句画面调速上限<input id="azure-video-adjust" type="number" min="0" max="0.50" step="0.01" value="0.18"></label><small class="setting-hint">设置值是相对 1 倍速度的调整幅度。例如 0.18 表示画面最多加快或放慢 18%。配音长于画面时放慢，短于画面时加快。</small><label>背景音音量<input id="azure-background-volume" type="number" min="0" max="1" step="0.05" value="0.55"></label><button type="submit" class="primary">保存速度与时间轴</button></form>`;
+$("#settings-grid").appendChild(timingPanel);
 $("#settings-grid").prepend($("#deepseek-form").closest(".panel"));
 async function loadDeepSeekConfig() {
   try {
@@ -89,12 +94,17 @@ $("#deepseek-remove").onclick = async () => {
     notify(e.message);
   }
 };
+let savedAzureConfig = null;
 function azureFormData() {
   return {
     region: $("#azure-region").value,
     voice: $("#azure-voice").value,
     hd_temperature: Number($("#azure-temperature").value),
     per_key_concurrency: Number($("#azure-per-key-concurrency").value),
+  };
+}
+function timingFormData() {
+  return {
     max_post_adjust: Number($("#azure-post-adjust").value),
     max_global_adjust: Number($("#azure-global-adjust").value),
     max_local_adjust: Number($("#azure-local-adjust").value),
@@ -154,27 +164,36 @@ async function refreshAzureVoices(selected) {
     `${r.region}：找到 ${r.voice_count} 个中文音色（HD ${r.voices.filter((v) => v.hd).length} 个）。`;
   return r;
 }
-async function loadAzureConfig() {
+async function loadAzureConfig({ preserveModel = false, preserveTiming = false } = {}) {
   try {
     const c = await api("/api/azure/config");
+    savedAzureConfig = Object.fromEntries(
+      ["region", "voice", "hd_temperature", "per_key_concurrency",
+        "max_post_adjust", "max_global_adjust", "max_local_adjust",
+        "max_video_adjust", "background_volume"].map((key) => [key, c[key]]),
+    );
     $("#azure-state").textContent = c.api_key_configured
       ? `${c.key_count} 把密钥`
       : "未配置";
     $("#azure-key-count").textContent = c.api_key_configured
       ? `已保存 ${c.key_count} 把密钥；输入新列表会整体替换`
       : "尚未保存密钥";
-    $("#azure-region").value = c.region;
-    setAzureVoices(c.voices, c.voice);
-    $("#azure-temperature").value = c.hd_temperature;
-    $("#azure-per-key-concurrency").value = c.per_key_concurrency;
-    $("#azure-post-adjust").value = c.max_post_adjust;
-    $("#azure-global-adjust").value = c.max_global_adjust;
-    $("#azure-local-adjust").value = c.max_local_adjust;
-    $("#azure-video-adjust").value = c.max_video_adjust;
-    $("#azure-background-volume").value = c.background_volume;
-    $("#azure-keys").value = "";
+    if (!preserveModel) {
+      $("#azure-region").value = c.region;
+      setAzureVoices(c.voices, c.voice);
+      $("#azure-temperature").value = c.hd_temperature;
+      $("#azure-per-key-concurrency").value = c.per_key_concurrency;
+      $("#azure-keys").value = "";
+    }
+    if (!preserveTiming) {
+      $("#azure-post-adjust").value = c.max_post_adjust;
+      $("#azure-global-adjust").value = c.max_global_adjust;
+      $("#azure-local-adjust").value = c.max_local_adjust;
+      $("#azure-video-adjust").value = c.max_video_adjust;
+      $("#azure-background-volume").value = c.background_volume;
+    }
     $("#azure-key-results").textContent = "";
-    if (c.api_key_configured && c.region)
+    if (!preserveModel && c.api_key_configured && c.region)
       refreshAzureVoices(c.voice).catch((e) => {
         $("#azure-voice-note").textContent = `音色列表读取失败：${e.message}`;
       });
@@ -187,16 +206,37 @@ $("#azure-form").onsubmit = async (e) => {
   const button = e.submitter;
   button.disabled = true;
   try {
+    if (!savedAzureConfig) throw new Error("Azure 配置仍在读取，请稍后重试");
     await api("/api/azure/config", {
       method: "PUT",
       headers: { "Content-Type": "application/json" },
       body: JSON.stringify({
+        ...savedAzureConfig,
         ...azureFormData(),
         api_keys: $("#azure-keys").value || null,
       }),
     });
-    await loadAzureConfig();
-    notify("Azure 配置已保存");
+    await loadAzureConfig({ preserveTiming: true });
+    notify("Azure 语音模型已保存");
+  } catch (err) {
+    notify(err.message);
+  } finally {
+    button.disabled = false;
+  }
+};
+$("#timing-form").onsubmit = async (e) => {
+  e.preventDefault();
+  const button = e.submitter;
+  button.disabled = true;
+  try {
+    if (!savedAzureConfig) throw new Error("速度配置仍在读取，请稍后重试");
+    await api("/api/azure/config", {
+      method: "PUT",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ ...savedAzureConfig, ...timingFormData() }),
+    });
+    await loadAzureConfig({ preserveModel: true });
+    notify("速度与时间轴设置已保存，下次配音时生效");
   } catch (err) {
     notify(err.message);
   } finally {
@@ -238,12 +278,13 @@ $("#azure-voice").onchange = updateAzureVoiceNote;
 $("#azure-region").onchange = updateAzureVoiceNote;
 $("#azure-remove").onclick = async () => {
   try {
+    if (!savedAzureConfig) throw new Error("Azure 配置仍在读取，请稍后重试");
     await api("/api/azure/config", {
       method: "PUT",
       headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ ...azureFormData(), remove_key: true }),
+      body: JSON.stringify({ ...savedAzureConfig, ...azureFormData(), remove_key: true }),
     });
-    await loadAzureConfig();
+    await loadAzureConfig({ preserveTiming: true });
     notify("Azure 密钥池已清空");
   } catch (e) {
     notify(e.message);
@@ -429,7 +470,7 @@ loadWatermarkConfig();
 const subtitlePanel = document.createElement("div");
 subtitlePanel.className = "panel upload-panel";
 subtitlePanel.id = "subtitle-panel";
-subtitlePanel.innerHTML = `<div class="section-head"><h2>成片字幕</h2><span>可选烧录</span></div><form id="subtitle-form"><label class="watermark-switch"><input id="subtitle-enabled" type="checkbox"> 烧录字幕到视频</label><label>字幕类型<select id="subtitle-mode"><option value="zh">仅中文</option><option value="bilingual">中文在上 · 英文在下</option></select></label><label>字号<input id="subtitle-font-size" type="number" min="14" max="60" step="1" value="28"></label><label>距底部像素<input id="subtitle-margin" type="number" min="0" max="200" step="1" value="42"></label><label>描边宽度<input id="subtitle-outline" type="number" min="0" max="5" step="1" value="2"></label><small class="setting-hint">字幕始终保留独立 SRT 下载。烧录使用与配音成片同步的时间轴；已有成片需重新配音。</small><button class="primary" type="submit">保存字幕设置</button></form>`;
+subtitlePanel.innerHTML = `<div class="section-head"><h2>成片字幕</h2><span>可选烧录</span></div><form id="subtitle-form"><label class="watermark-switch"><input id="subtitle-enabled" type="checkbox"> 烧录字幕到视频</label><label>字幕类型<select id="subtitle-mode"><option value="zh">仅中文</option><option value="bilingual">中文在上 · 英文在下</option></select></label><label>字号<input id="subtitle-font-size" type="number" min="5" max="60" step="1" value="28"></label><label>距底部像素<input id="subtitle-margin" type="number" min="0" max="200" step="1" value="42"></label><label>描边宽度<input id="subtitle-outline" type="number" min="0" max="5" step="1" value="2"></label><small class="setting-hint">字幕始终保留独立 SRT 下载。烧录使用与配音成片同步的时间轴；已有成片需重新配音。</small><button class="primary" type="submit">保存字幕设置</button></form>`;
 $("#settings-grid").appendChild(subtitlePanel);
 async function loadSubtitleConfig() {
   try {
@@ -549,6 +590,8 @@ for (const [panel, open] of [
   [$("#deepseek-form").closest(".panel"), true],
   [youtubePanel, false],
   [azurePanel, false],
+  [doubaoPanel, false],
+  [timingPanel, false],
   [subtitlePanel, false],
   [watermarkPanel, false],
 ]) {

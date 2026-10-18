@@ -369,6 +369,29 @@ class AzureDubbingTests(unittest.TestCase):
             self.assertEqual(encoder, "libx264")
             self.assertGreater(output.stat().st_size, 0)
 
+    def test_long_retiming_filter_uses_script_instead_of_windows_command_line(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source, voice, output = (root / name for name in ("source.mp4", "voice.wav", "dubbed.mp4"))
+            pieces = [{"start": i, "end": i + 1, "speed": .95 if i % 2 else 1.05}
+                      for i in range(201)]
+            scripts = []
+
+            def check_command(command, **kwargs):
+                self.assertIn("-filter_complex_script", command)
+                script = Path(command[command.index("-filter_complex_script") + 1])
+                self.assertTrue(script.is_file())
+                self.assertIn("concat=n=201", script.read_text(encoding="utf-8"))
+                scripts.append(script)
+                Path(command[-1]).write_bytes(b"encoded")
+                return subprocess.CompletedProcess(command, 0, "", "")
+
+            with patch.object(azure.subprocess, "run", side_effect=check_command):
+                self.assertEqual(azure.render_video(source, None, voice, output, 201, .55, pieces),
+                                 "h264_nvenc")
+            self.assertEqual(output.read_bytes(), b"encoded")
+            self.assertTrue(all(not script.exists() for script in scripts))
+
     def test_ffmpeg_replaces_original_audio_without_separation(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

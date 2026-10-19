@@ -6,6 +6,7 @@ import json
 import hashlib
 import copy
 import io
+import math
 import re
 import shutil
 import sqlite3
@@ -61,6 +62,7 @@ from ..rendering.watermark import (DEFAULTS as WATERMARK_DEFAULTS, load_config a
                        save_config as save_watermark_config)
 from ..rendering.subtitles import (DEFAULTS as SUBTITLE_DEFAULTS, load_config as load_subtitle_config,
                            save_config as save_subtitle_config)
+from ..rendering import manual_edit
 from ..storage import jobs as job_store
 from ..services import translation as translation_service, dubbing as dubbing_service
 from . import settings as settings_service
@@ -186,11 +188,14 @@ def invalidate_translation(job_id: str):
 
 
 def invalidate_dubbing(job_id: str, preserve_report: bool = False):
-    suffixes = ["voice.wav", "dubbed.mp4", "dubbed-zh.srt", "dubbed-bilingual.srt"]
+    suffixes = ["voice.wav", "dubbed.mp4", "dubbed-zh.srt", "dubbed-bilingual.srt",
+                "manual-edit.json", "edited.mp4", "edited-zh.srt", "edited-bilingual.srt"]
     if not preserve_report:
         suffixes.append("dubbing-report.json")
     for suffix in suffixes:
         (DATA / f"{job_id}-{suffix}").unlink(missing_ok=True)
+    for thumbnail in DATA.glob(f"{job_id}-edit-thumb-*.jpg"):
+        thumbnail.unlink(missing_ok=True)
     update_job(job_id, dubbing_status="not_started", dubbing_progress=0,
                dubbing_total=0, dubbing_error="")
 
@@ -291,6 +296,8 @@ def _selected_jobs(ids: list[str]) -> list[dict]:
         raise HTTPException(400, "请选择 1–100 个不同的任务")
     jobs = [get_job(job_id) for job_id in ids]
     for job in jobs:
+        if job["id"] in _manual_edit_running:
+            raise HTTPException(409, f"任务 {job['title']} 正在导出剪辑版，请完成后再操作")
         if (job["status"] in ("queued", "running")
                 or job["translation_status"] in ("queued", "correcting", "glossary", "running")
                 or job["dubbing_status"] in ("queued", "running")):
@@ -854,6 +861,8 @@ def dub_job(job_id: str):
 @app.post("/api/jobs/{job_id}/dub")
 def start_dubbing(job_id: str):
     job = get_job(job_id)
+    if job_id in _manual_edit_running:
+        raise HTTPException(409, "剪辑导出正在进行，请完成后再重新配音")
     if job["translation_status"] != "done":
         raise HTTPException(409, "请先完成中文翻译")
     if job["dubbing_status"] in ("queued", "running"):
@@ -910,6 +919,189 @@ def preview_dubbed_video(job_id: str):
     if job["dubbing_status"] != "done" or not path.is_file():
         raise HTTPException(404, "配音视频尚未就绪")
     return FileResponse(path, media_type="video/mp4")
+
+
+def _manual_edit_paths(job_id: str) -> tuple[Path, Path, Path]:
+    return (DATA / f"{job_id}-manual-edit.json", DATA / f"{job_id}-dubbed.mp4",
+            DATA / f"{job_id}-edited.mp4")
+
+
+def _manual_edit_source(job_id: str) -> Path:
+    job = get_job(job_id)
+    source = DATA / f"{job_id}-dubbed.mp4"
+    if job["dubbing_status"] != "done" or not source.is_file():
+        raise HTTPException(409, "请先完成配音成片")
+    return source
+
+
+def _read_manual_edit(job_id: str) -> dict:
+    state_path, source, output = _manual_edit_paths(job_id)
+    duration = manual_edit.duration_seconds(source)
+    identity = manual_edit.source_id(source)
+    if state_path.is_file():
+        state = json.loads(state_path.read_text(encoding="utf-8"))
+        if state.get("source_id") != identity:
+            state = {}
+    else:
+        state = {}
+    if not state:
+        state = {"source_id": identity, "ranges": [{"start": 0, "end": round(duration, 3)}],
+                 "status": "draft", "error": "", "revision": uuid.uuid4().hex}
+    if state["status"] in ("queued", "rendering") and not job_id in _manual_edit_running:
+        state["status"] = "interrupted"
+        state["error"] = "剪辑导出已中断，请重新导出"
+    return {**state, "duration": duration,
+            "edited_video_available": state["status"] == "done" and output.is_file()}
+
+
+def _write_manual_edit(job_id: str, state: dict) -> None:
+    path = DATA / f"{job_id}-manual-edit.json"
+    temporary = path.with_name(f".{path.stem}.{uuid.uuid4().hex}.tmp")
+    try:
+        temporary.write_text(json.dumps({k: v for k, v in state.items() if k not in
+                                         ("duration", "edited_video_available")}, ensure_ascii=False),
+                             encoding="utf-8")
+        temporary.replace(path)
+    finally:
+        temporary.unlink(missing_ok=True)
+
+
+_manual_edit_running: set[str] = set()
+
+
+class ManualEditDraft(BaseModel):
+    ranges: list[dict]
+
+
+@app.get("/api/jobs/{job_id}/manual-edit")
+def get_manual_edit(job_id: str):
+    _manual_edit_source(job_id)
+    with db_lock:
+        return _read_manual_edit(job_id)
+
+
+@app.put("/api/jobs/{job_id}/manual-edit")
+def save_manual_edit(job_id: str, body: ManualEditDraft):
+    _manual_edit_source(job_id)
+    with db_lock:
+        state = _read_manual_edit(job_id)
+        if job_id in _manual_edit_running:
+            raise HTTPException(409, "剪辑导出正在进行，请完成后修改")
+        try:
+            ranges = manual_edit.validate_ranges(body.ranges, state["duration"])
+        except ValueError as exc:
+            raise HTTPException(400, str(exc)) from exc
+        if ranges != state["ranges"]:
+            state.update(ranges=ranges, status="draft", error="", revision=uuid.uuid4().hex)
+        _write_manual_edit(job_id, state)
+        return _read_manual_edit(job_id)
+
+
+def _export_manual_edit(job_id: str, revision: str) -> None:
+    try:
+        with db_lock:
+            source = _manual_edit_source(job_id)
+            state = _read_manual_edit(job_id)
+            if state["revision"] != revision:
+                return
+            state["status"] = "rendering"
+            _write_manual_edit(job_id, state)
+        _, _, output = _manual_edit_paths(job_id)
+        manual_edit.render_edit(source, output, state["ranges"], DATA / f"{job_id}.log")
+        for kind in ("zh", "bilingual"):
+            original = DATA / f"{job_id}-dubbed-{kind}.srt"
+            edited = DATA / f"{job_id}-edited-{kind}.srt"
+            if original.is_file():
+                edited.write_text(manual_edit.retime_srt(original.read_text(encoding="utf-8-sig"),
+                                                         state["ranges"]), encoding="utf-8-sig")
+        with db_lock:
+            state["status"] = "done"
+            state["error"] = ""
+            _write_manual_edit(job_id, state)
+    except Exception as exc:
+        with db_lock:
+            state_path = DATA / f"{job_id}-manual-edit.json"
+            if state_path.is_file():
+                state = json.loads(state_path.read_text(encoding="utf-8"))
+                if state.get("revision") == revision:
+                    state.update(status="failed", error=str(exc))
+                    _write_manual_edit(job_id, state)
+        with (DATA / f"{job_id}.log").open("a", encoding="utf-8") as log:
+            log.write(f"手动剪辑导出失败：{exc}\n")
+    finally:
+        with db_lock:
+            _manual_edit_running.discard(job_id)
+
+
+@app.post("/api/jobs/{job_id}/manual-edit/export")
+def export_manual_edit(job_id: str):
+    _manual_edit_source(job_id)
+    with db_lock:
+        if job_id in _manual_edit_running:
+            raise HTTPException(409, "剪辑导出正在进行")
+        state = _read_manual_edit(job_id)
+        state["status"] = "queued"
+        state["error"] = ""
+        state["export_id"] = uuid.uuid4().hex
+        _write_manual_edit(job_id, state)
+        _manual_edit_running.add(job_id)
+        executor.submit(_export_manual_edit, job_id, state["revision"])
+        return _read_manual_edit(job_id)
+
+
+@app.get("/api/jobs/{job_id}/edited-preview.mp4")
+def preview_edited_video(job_id: str):
+    _manual_edit_source(job_id)
+    state = _read_manual_edit(job_id)
+    if not state["edited_video_available"]:
+        raise HTTPException(404, "剪辑成片尚未就绪")
+    return FileResponse(DATA / f"{job_id}-edited.mp4", media_type="video/mp4")
+
+
+@app.get("/api/jobs/{job_id}/edited.mp4")
+def download_edited_video(job_id: str):
+    job = get_job(job_id)
+    preview_edited_video(job_id)
+    return FileResponse(DATA / f"{job_id}-edited.mp4", media_type="video/mp4",
+                        filename=download_filename(job, "-剪辑版.mp4"))
+
+
+@app.get("/api/jobs/{job_id}/edited-{kind}.srt")
+def download_edited_srt(job_id: str, kind: str):
+    if kind not in ("zh", "bilingual"):
+        raise HTTPException(404, "字幕类型不存在")
+    preview_edited_video(job_id)
+    path = DATA / f"{job_id}-edited-{kind}.srt"
+    if not path.is_file():
+        raise HTTPException(404, "剪辑字幕不存在")
+    return FileResponse(path, media_type="text/plain; charset=utf-8",
+                        filename=download_filename(get_job(job_id), f"-剪辑版-{kind}.srt"))
+
+
+@app.get("/api/jobs/{job_id}/edit-thumb/{index}.jpg")
+def manual_edit_thumbnail(job_id: str, index: int):
+    source = _manual_edit_source(job_id)
+    duration = manual_edit.duration_seconds(source)
+    count = min(40, max(1, math.ceil(duration / 45)))
+    if index < 0 or index >= count:
+        raise HTTPException(404, "缩略图序号无效")
+    path = DATA / f"{job_id}-edit-thumb-{index:02}.jpg"
+    if not path.is_file() or path.stat().st_mtime_ns < source.stat().st_mtime_ns:
+        temporary = DATA / f".{job_id}-edit-thumb-{index:02}-{uuid.uuid4().hex}.jpg"
+        try:
+            at = min(duration - .05, (index + .5) * duration / count)
+            command = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-nostdin", "-y",
+                       "-ss", str(max(0, at)), "-i", str(source), "-frames:v", "1",
+                       "-vf", "scale=240:-2", "-q:v", "5", str(temporary)]
+            result = subprocess.run(command, capture_output=True, text=True, timeout=30, check=False)
+            if result.returncode or not temporary.is_file():
+                raise RuntimeError(result.stderr[-300:] or "缩略图生成失败")
+            temporary.replace(path)
+        except (OSError, subprocess.TimeoutExpired, RuntimeError) as exc:
+            raise HTTPException(503, f"无法生成缩略图：{exc}") from exc
+        finally:
+            temporary.unlink(missing_ok=True)
+    return FileResponse(path, media_type="image/jpeg")
 
 
 @app.get("/api/jobs/{job_id}/dubbed-zh.srt")
@@ -1175,6 +1367,10 @@ def publish_bilibili(job_id: str, body: BilibiliDraft):
     video = DATA / f"{job_id}-dubbed.mp4"
     if not video.is_file():
         raise HTTPException(409, "请先生成配音成片")
+    if (DATA / f"{job_id}-manual-edit.json").is_file():
+        edit_state = _read_manual_edit(job_id)
+        if edit_state["edited_video_available"]:
+            video = DATA / f"{job_id}-edited.mp4"
     meta = _save_bilibili_draft(job_id, body, require_text=True)
     source = (job.get("source_url") or "").strip()
     meta["copyright"] = 1

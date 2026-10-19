@@ -409,6 +409,7 @@ function renderEditor() {
     preview.className = "subpanel finished-preview";
     preview.innerHTML = `<h3>成片预览</h3><video id="finished-video" controls playsinline preload="metadata" src="/api/jobs/${active}/preview.mp4"></video><p>包含中文配音和成片字幕设置；可拖动进度查看。</p>`;
     $("#detail-content").prepend(preview);
+    mountManualEdit(active, preview);
   }
   $$("[data-filter]").forEach(
     (b) =>

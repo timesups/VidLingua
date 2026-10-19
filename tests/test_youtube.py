@@ -67,6 +67,21 @@ class YouTubeTests(unittest.TestCase):
             self.assertIn("YouTube: 50%", log.read_text(encoding="utf-8"))
             self.assertEqual(seen, [("https://www.youtube.com/watch?v=abcdefghijk", True)])
 
+    def test_jpeg_thumbnail_is_saved_beside_the_video(self):
+        jpeg = b"\xff\xd8\xff\xd9"
+        response = type("Response", (), {"content": jpeg, "raise_for_status": lambda self: None})()
+        with tempfile.TemporaryDirectory() as directory, \
+             patch.object(youtube, "_thumbnail_session") as session:
+            session.return_value.get.return_value = response
+            cover = Path(directory) / "cover.jpg"
+            saved = youtube.save_youtube_cover(
+                {"thumbnails": [{"url": "https://i.ytimg.com/vi/abcdefghijk/maxresdefault.jpg", "width": 1280}]},
+                cover, Path(directory) / "config.json")
+            self.assertTrue(saved)
+            self.assertEqual(cover.read_bytes(), jpeg)
+            self.assertFalse(youtube.save_youtube_cover({}, Path(directory) / "missing.jpg",
+                                                        Path(directory) / "missing.json"))
+
     def test_saved_proxy_and_cookies_are_used_by_downloader(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)

@@ -291,7 +291,8 @@ class JobCreationTests(unittest.TestCase):
                 self.assertEqual(job["status"], "created")
                 self.assertEqual(job["translation_status"], "not_started")
                 self.assertEqual(job["separate_vocals"], 1)
-                self.assertEqual(job["dubbing_engine"], "azure")
+                self.assertEqual(job["dubbing_engine"], "doubao")
+                self.assertEqual(web_app.download_filename({"title": "课程: 第一集"}, ".mp4"), "课程 第一集.mp4")
                 self.assertEqual(Path(job["upload_path"]).read_bytes(), b"video data")
                 no_split = web_app.create_job(
                     UploadFile(filename="course.mp4", file=io.BytesIO(b"another video")),
@@ -310,7 +311,7 @@ class JobCreationTests(unittest.TestCase):
                 self.assertEqual(job["stage"], "download")
                 self.assertEqual(job["source_url"], "https://www.youtube.com/watch?v=abcdefghijk")
                 self.assertEqual(job["separate_vocals"], 0)
-                self.assertEqual(job["dubbing_engine"], "azure")
+                self.assertEqual(job["dubbing_engine"], "doubao")
                 doubao = web_app.create_youtube_job(web_app.YouTubeJobCreate(
                     url="https://www.youtube.com/watch?v=abcdefghijk", dubbing_engine="doubao"))
                 self.assertEqual(doubao["dubbing_engine"], "doubao")

@@ -5,9 +5,12 @@ from __future__ import annotations
 import json
 import os
 import re
+import subprocess
 import tempfile
 from pathlib import Path
 from urllib.parse import parse_qs, urlsplit
+
+import requests
 
 from .import_media import probe
 
@@ -125,6 +128,72 @@ def canonical_youtube_url(value: str) -> tuple[str, str]:
     return f"https://www.youtube.com/watch?v={video_id}", video_id
 
 
+def _thumbnail_url(info: dict) -> str:
+    candidates = []
+    for item in info.get("thumbnails") or []:
+        url = str(item.get("url") or "")
+        if url.startswith("http"):
+            candidates.append((int(item.get("width") or 0), url))
+    if candidates:
+        return max(candidates)[1]
+    url = str(info.get("thumbnail") or "")
+    return url if url.startswith("http") else ""
+
+
+def _thumbnail_session(config_path: Path) -> requests.Session:
+    config = load_config(config_path)
+    session = requests.Session()
+    if config["proxy_mode"] == "direct":
+        session.trust_env = False
+    elif config["proxy_mode"] == "local":
+        proxy = f"http://127.0.0.1:{config['proxy_port']}"
+        session.proxies.update({"http": proxy, "https": proxy})
+        session.trust_env = False
+    return session
+
+
+def save_youtube_cover(info: dict, cover_path: Path, config_path: Path = CONFIG_PATH) -> bool:
+    """Save the largest YouTube thumbnail as a JPEG cover. Missing art is not an error."""
+    url = _thumbnail_url(info)
+    if not url or (cover_path.is_file() and cover_path.stat().st_size > 0):
+        return cover_path.is_file()
+    response = _thumbnail_session(config_path).get(url, timeout=30)
+    response.raise_for_status()
+    data = response.content
+    if not data:
+        return False
+    cover_path.parent.mkdir(parents=True, exist_ok=True)
+    if data[:2] == b"\xff\xd8":
+        cover_path.write_bytes(data)
+        return True
+    raw = cover_path.with_suffix(".source")
+    raw.write_bytes(data)
+    try:
+        result = subprocess.run(
+            ["ffmpeg", "-hide_banner", "-loglevel", "error", "-nostdin", "-y",
+             "-i", str(raw), "-frames:v", "1", "-q:v", "3", str(cover_path)],
+            capture_output=True, check=False)
+    finally:
+        raw.unlink(missing_ok=True)
+    return result.returncode == 0 and cover_path.is_file() and cover_path.stat().st_size > 0
+
+
+def ensure_youtube_cover(url: str, cover_path: Path, config_path: Path = CONFIG_PATH,
+                         cookie_path: Path = COOKIE_PATH) -> bool:
+    if cover_path.is_file() and cover_path.stat().st_size > 0:
+        return True
+    import yt_dlp
+
+    canonical, _video_id = canonical_youtube_url(url)
+    options = {**ydl_network_options(config_path, cookie_path), "quiet": True,
+               "no_warnings": True, "noplaylist": True}
+    with yt_dlp.YoutubeDL(options) as ydl:
+        info = ydl.extract_info(canonical, download=False)
+    if not info:
+        return False
+    return save_youtube_cover(info, cover_path, config_path)
+
+
 def download_youtube(url: str, destination: Path, log_path: Path,
                      config_path: Path = CONFIG_PATH, cookie_path: Path = COOKIE_PATH) -> dict:
     """Download into a staging file, verify streams, then publish the MP4."""
@@ -183,6 +252,13 @@ def download_youtube(url: str, destination: Path, log_path: Path,
             info = ydl.extract_info(canonical, download=True)
         if not info or str(info.get("id")) != video_id:
             raise RuntimeError("YouTube 返回的视频与提交的链接不一致")
+        try:
+            if not save_youtube_cover(info, destination.with_name("cover.jpg"), config_path):
+                with log_path.open("a", encoding="utf-8") as output:
+                    output.write("YouTube: 未找到可保存的封面\n")
+        except Exception as exc:
+            with log_path.open("a", encoding="utf-8") as output:
+                output.write(f"YouTube: 封面下载失败：{exc}\n")
         if not staging.is_file() or staging.stat().st_size == 0:
             raise RuntimeError("YouTube 下载未生成 MP4 文件")
         _verify_video(staging)

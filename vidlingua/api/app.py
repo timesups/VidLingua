@@ -15,7 +15,7 @@ import threading
 import uuid
 import wave
 from concurrent.futures import ThreadPoolExecutor, as_completed
-from contextlib import contextmanager
+from contextlib import asynccontextmanager, contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -50,6 +50,7 @@ from ..providers.doubao_speech import (DEFAULTS as DOUBAO_DEFAULTS, RESOURCE_IDS
                                        synthesize as doubao_synthesize,
                                        validate_config as validate_doubao_config,
                                        validate_key as validate_doubao_key)
+from ..providers import bilibili as bilibili_provider
 from ..providers.deepseek import (DEFAULTS, MODELS, delete_api_key, get_api_key, load_config,
                                   make_srt, make_bilingual_srt, make_english_srt, save_config, set_api_key,
                                   translate_group, correct_english_group, call_deepseek,
@@ -75,12 +76,20 @@ WATERMARK_CONFIG = DATA / "watermark_config.json"
 SUBTITLE_CONFIG = DATA / "subtitle_config.json"
 YOUTUBE_CONFIG = DATA / "youtube_config.json"
 YOUTUBE_COOKIES = DATA / "youtube_cookies.txt"
+BILIBILI_CONFIG = DATA / "bilibili_config.json"
+BILIBILI_COOKIES = DATA / "bilibili_cookies.json"
 WEB = ROOT / "web"
 DATA.mkdir(exist_ok=True)
 UPLOADS.mkdir(exist_ok=True)
 executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="vidlingua-gpu")
 db_lock = threading.RLock()
-app = FastAPI(title="VidLingua", docs_url="/api/docs")
+@asynccontextmanager
+async def app_lifespan(application: FastAPI):
+    initialize()
+    yield
+
+
+app = FastAPI(title="VidLingua", docs_url="/api/docs", lifespan=app_lifespan)
 app.mount("/static", StaticFiles(directory=WEB), name="static")
 
 
@@ -92,7 +101,6 @@ def initialize():
     job_store.initialize(connect)
 
 
-initialize()
 
 
 def now():
@@ -101,6 +109,13 @@ def now():
 
 def get_job(job_id: str) -> dict:
     return job_store.get_job(connect, job_id)
+
+
+def download_filename(job: dict, suffix: str) -> str:
+    raw = str(job.get("title") or Path(str(job.get("filename") or "")).stem or "video")
+    cleaned = re.sub(r'[<>:"/\\|?*\x00-\x1f]', " ", raw)
+    cleaned = re.sub(r"\s+", " ", cleaned).strip().rstrip(". ")
+    return f"{(cleaned or 'video')[:80]}{suffix}"
 
 
 def update_job(job_id: str, **fields):
@@ -225,6 +240,9 @@ def process(job_id: str, reuse_download: bool = False):
         update_job(job_id, stage="transcribe")
         audio_source = "vocals" if separate else "original"
         transcript = run / f"transcript_{audio_source}" / ("asr_vocals.json" if separate else "asr_audio.json")
+        with log.open("a", encoding="utf-8") as output:
+            output.write(f"ASR 输入：{audio_source}，音频文件：{'asr_vocals.wav' if separate else 'asr_audio.wav'}，"
+                         f"现有转写：{'复用并复查' if transcript.is_file() else '重新识别'}\n")
         if not transcript.is_file():
             with log.open("a", encoding="utf-8") as output:
                 result = subprocess.run([sys.executable, "-m", "vidlingua.pipeline.transcribe",
@@ -233,6 +251,13 @@ def process(job_id: str, reuse_download: bool = False):
                                         check=False)
             if result.returncode or not transcript.is_file():
                 raise RuntimeError(f"WhisperX 失败，退出码 {result.returncode}；请查看处理日志")
+        if transcript.is_file():
+            from vidlingua.pipeline.transcribe import recover_transcript_gaps
+            source_audio = run / ("asr_vocals.wav" if separate else "asr_audio.wav")
+            def record_asr(message: str) -> None:
+                with log.open("a", encoding="utf-8") as output:
+                    output.write(message + "\n")
+            recover_transcript_gaps(source_audio, transcript, logger=record_asr)
         update_job(job_id, stage="organize")
         duration = json.loads((run / "manifest.json").read_text(encoding="utf-8"))["media"]["duration_seconds"]
         if not segment_rows(job_id):
@@ -337,7 +362,7 @@ def bulk_delete_jobs(selection: JobSelection):
 
 @app.post("/api/jobs")
 def create_job(file: UploadFile = File(...), title: str = Form(""),
-               separate_vocals: bool = Form(True), dubbing_engine: str = Form("azure")):
+               separate_vocals: bool = Form(False), dubbing_engine: str = Form("doubao")):
     filename = Path(file.filename or "video.mp4").name
     if Path(filename).suffix.lower() != ".mp4":
         raise HTTPException(400, "首版仅支持 MP4 视频")
@@ -350,7 +375,7 @@ def create_job(file: UploadFile = File(...), title: str = Form(""),
     if upload.stat().st_size == 0:
         upload.unlink()
         raise HTTPException(400, "文件为空")
-    engine = _valid_engine(dubbing_engine if isinstance(dubbing_engine, str) else "azure")
+    engine = _valid_engine(dubbing_engine if isinstance(dubbing_engine, str) else "doubao")
     timestamp = now()
     with db_lock, connect() as conn:
         conn.execute("""INSERT INTO jobs
@@ -365,8 +390,8 @@ def create_job(file: UploadFile = File(...), title: str = Form(""),
 class YouTubeJobCreate(BaseModel):
     url: str
     title: str = ""
-    separate_vocals: bool = True
-    dubbing_engine: str = "azure"
+    separate_vocals: bool = False
+    dubbing_engine: str = "doubao"
 
 
 class YouTubeConfigEdit(BaseModel):
@@ -447,6 +472,12 @@ def delete_job(job_id: str):
     return {"deleted": job_id}
 
 
+def _asr_diagnostics_path(job: dict) -> Path:
+    source = "vocals" if job["separate_vocals"] else "original"
+    stem = "asr_vocals" if job["separate_vocals"] else "asr_audio"
+    return Path(job["run_path"]) / f"transcript_{source}" / f"{stem}.diagnostics.json"
+
+
 @app.get("/api/jobs/{job_id}")
 def job_detail(job_id: str):
     job = get_job(job_id)
@@ -458,6 +489,8 @@ def job_detail(job_id: str):
     job["dubbing_report_available"] = (DATA / f"{job_id}-dubbing-report.json").is_file()
     job["dubbed_video_available"] = (job["dubbing_status"] == "done"
                                      and (DATA / f"{job_id}-dubbed.mp4").is_file())
+    job["asr_diagnostics_available"] = (_asr_diagnostics_path(job).is_file()
+                                        if job.get("run_path") else False)
     job["stage_progress"] = stage_progress(job, job_id)
     return job
 
@@ -544,20 +577,22 @@ def prepare(job_id: str):
 
 @app.get("/api/jobs/{job_id}/translation-input.json")
 def download_translation(job_id: str):
-    get_job(job_id)
+    job = get_job(job_id)
     path = DATA / f"{job_id}-translation-input.json"
     if not path.is_file():
         raise HTTPException(404, "请先准备译前包")
-    return FileResponse(path, media_type="application/json", filename=f"{job_id}-translation-input.json")
+    return FileResponse(path, media_type="application/json",
+                        filename=download_filename(job, ".translation.json"))
 
 
 @app.get("/api/jobs/{job_id}/corrected-en.srt")
 def download_corrected_english(job_id: str):
-    get_job(job_id)
+    job = get_job(job_id)
     path = DATA / f"{job_id}-corrected-en.srt"
     if not path.is_file():
         raise HTTPException(404, "英文校正尚未完成")
-    return FileResponse(path, media_type="text/plain; charset=utf-8", filename=f"{job_id}-corrected-en.srt")
+    return FileResponse(path, media_type="text/plain; charset=utf-8",
+                        filename=download_filename(job, ".en.srt"))
 
 
 @app.get("/api/jobs/{job_id}/media/{kind}")
@@ -596,6 +631,18 @@ def log(job_id: str):
     if message:
         lines.append(f"[提醒] {message}")
     return {"text": "\n".join(lines)[-12000:]}
+
+
+@app.get("/api/jobs/{job_id}/asr-diagnostics.json")
+def download_asr_diagnostics(job_id: str):
+    job = get_job(job_id)
+    if not job.get("run_path"):
+        raise HTTPException(404, "识别诊断尚未生成")
+    path = _asr_diagnostics_path(job)
+    if not path.is_file():
+        raise HTTPException(404, "识别诊断尚未生成")
+    return FileResponse(path, media_type="application/json",
+                        filename=download_filename(job, ".asr.json"))
 
 
 class DeepSeekConfigEdit(BaseModel):
@@ -707,11 +754,12 @@ def glossary_result(job_id: str):
 
 @app.get("/api/jobs/{job_id}/zh.srt")
 def download_srt(job_id: str):
-    get_job(job_id)
+    job = get_job(job_id)
     path = DATA / f"{job_id}-zh.srt"
     if not path.is_file():
         raise HTTPException(404, "尚无中文字幕")
-    return FileResponse(path, media_type="text/plain; charset=utf-8", filename=f"{job_id}-zh.srt")
+    return FileResponse(path, media_type="text/plain; charset=utf-8",
+                        filename=download_filename(job, ".zh.srt"))
 
 
 @app.get("/api/jobs/{job_id}/bilingual.srt")
@@ -725,7 +773,8 @@ def download_bilingual_srt(job_id: str):
     bilingual = make_bilingual_srt(items)
     if not path.is_file() or path.read_text(encoding="utf-8-sig") != bilingual:
         path.write_text(bilingual, encoding="utf-8-sig")
-    return FileResponse(path, media_type="text/plain; charset=utf-8", filename=f"{job_id}-bilingual.srt")
+    return FileResponse(path, media_type="text/plain; charset=utf-8",
+                        filename=download_filename(job, ".bilingual.srt"))
 
 
 class AzureConfigEdit(BaseModel):
@@ -772,6 +821,7 @@ class DoubaoConfigEdit(BaseModel):
     resource_id: str = DOUBAO_DEFAULTS["resource_id"]
     speaker: str = DOUBAO_DEFAULTS["speaker"]
     concurrency: int = DOUBAO_DEFAULTS["concurrency"]
+    calmness: int = DOUBAO_DEFAULTS["calmness"]
     api_key: str | None = None
     remove_key: bool = False
 
@@ -837,11 +887,11 @@ def start_dubbing(job_id: str):
 
 @app.get("/api/jobs/{job_id}/voice.wav")
 def download_voice(job_id: str):
-    get_job(job_id)
+    job = get_job(job_id)
     path = DATA / f"{job_id}-voice.wav"
     if not path.is_file():
         raise HTTPException(404, "尚无中文配音轨")
-    return FileResponse(path, media_type="audio/wav", filename=f"{job_id}-voice.wav")
+    return FileResponse(path, media_type="audio/wav", filename=download_filename(job, ".wav"))
 
 
 @app.get("/api/jobs/{job_id}/dubbed.mp4")
@@ -850,7 +900,7 @@ def download_dubbed_video(job_id: str):
     path = DATA / f"{job_id}-dubbed.mp4"
     if job["dubbing_status"] != "done" or not path.is_file():
         raise HTTPException(404, "配音视频尚未就绪")
-    return FileResponse(path, media_type="video/mp4", filename=f"{job_id}-dubbed.mp4")
+    return FileResponse(path, media_type="video/mp4", filename=download_filename(job, ".mp4"))
 
 
 @app.get("/api/jobs/{job_id}/preview.mp4")
@@ -868,7 +918,8 @@ def download_dubbed_srt(job_id: str):
     path = DATA / f"{job_id}-dubbed-zh.srt"
     if job["dubbing_status"] != "done" or not path.is_file():
         raise HTTPException(404, "配音字幕尚未就绪")
-    return FileResponse(path, media_type="text/plain; charset=utf-8", filename=f"{job_id}-dubbed-zh.srt")
+    return FileResponse(path, media_type="text/plain; charset=utf-8",
+                        filename=download_filename(job, ".srt"))
 
 
 @app.get("/api/jobs/{job_id}/dubbed-bilingual.srt")
@@ -877,7 +928,8 @@ def download_dubbed_bilingual_srt(job_id: str):
     path = DATA / f"{job_id}-dubbed-bilingual.srt"
     if job["dubbing_status"] != "done" or not path.is_file():
         raise HTTPException(404, "配音双语字幕尚未就绪")
-    return FileResponse(path, media_type="text/plain; charset=utf-8", filename=f"{job_id}-dubbed-bilingual.srt")
+    return FileResponse(path, media_type="text/plain; charset=utf-8",
+                        filename=download_filename(job, ".bilingual.srt"))
 
 
 @app.get("/api/jobs/{job_id}/dubbing-report.json")
@@ -999,3 +1051,148 @@ def drop_translation_segment(job_id: str, segment_id: str):
             report_path.write_text(json.dumps(report, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
         invalidate_dubbing(job_id, preserve_report=True)
     return {"ok": True, "id": segment_id}
+
+
+class BilibiliCookie(BaseModel):
+    cookie: str
+
+
+class BilibiliSettings(BaseModel):
+    tid: int
+    tags: str
+
+
+class BilibiliDraft(BaseModel):
+    title: str = ""
+    desc: str = ""
+    tags: str = ""
+    dynamic: str = ""
+    tid: int = 229
+
+
+def _bilibili_view(job_id: str) -> dict:
+    return bilibili_provider.load_job_meta(DATA / f"{job_id}-bilibili.json",
+                                           bilibili_provider.load_config(BILIBILI_CONFIG))
+
+
+def _save_bilibili_draft(job_id: str, body: BilibiliDraft, *, require_text: bool) -> dict:
+    settings = bilibili_provider.load_config(BILIBILI_CONFIG)
+    current = _bilibili_view(job_id)
+    title = body.title.strip()[:80]
+    desc = body.desc.strip()[:2000]
+    if require_text and (not title or not desc):
+        raise HTTPException(400, "请先填写中文标题和简介")
+    current.update({"title": title, "desc": desc,
+                    "tags": bilibili_provider.tag_text(body.tags) or settings["tags"],
+                    "dynamic": str(current.get("dynamic") or "")[:100],
+                    "tid": int(settings["tid"])})
+    bilibili_provider.save_job_meta(DATA / f"{job_id}-bilibili.json", current)
+    return current
+
+
+@app.get("/api/bilibili/status")
+def bilibili_status():
+    try:
+        return bilibili_provider.login_status(BILIBILI_COOKIES)
+    except Exception as exc:
+        return {"logged_in": False, "message": str(exc) or "无法连接 B 站"}
+
+
+@app.put("/api/bilibili/cookie")
+def bilibili_cookie(body: BilibiliCookie):
+    try:
+        return bilibili_provider.save_cookie_login(BILIBILI_COOKIES, body.cookie)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(502, str(exc) or "无法验证 B 站 Cookie") from exc
+
+
+@app.delete("/api/bilibili/cookie")
+def bilibili_logout():
+    bilibili_provider.clear_cookies(BILIBILI_COOKIES)
+    return {"ok": True}
+
+
+@app.get("/api/bilibili/partitions")
+def bilibili_partitions():
+    return bilibili_provider.PARTITIONS
+
+
+@app.get("/api/bilibili/settings")
+def bilibili_settings():
+    return bilibili_provider.load_config(BILIBILI_CONFIG)
+
+
+@app.put("/api/bilibili/settings")
+def save_bilibili_settings(body: BilibiliSettings):
+    try:
+        bilibili_provider.save_config(BILIBILI_CONFIG, body.model_dump())
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    return bilibili_provider.load_config(BILIBILI_CONFIG)
+
+
+@app.get("/api/jobs/{job_id}/bilibili")
+def job_bilibili(job_id: str):
+    get_job(job_id)
+    return _bilibili_view(job_id)
+
+
+@app.post("/api/jobs/{job_id}/bilibili/meta")
+def generate_bilibili_meta(job_id: str):
+    job = get_job(job_id)
+    if job["translation_status"] != "done":
+        raise HTTPException(409, "请先完成中文翻译")
+    api_key = get_api_key()
+    if not api_key:
+        raise HTTPException(400, "请先在设置中保存 DeepSeek API Key")
+    subtitle_path = DATA / f"{job_id}-dubbed-zh.srt"
+    if not subtitle_path.is_file():
+        subtitle_path = DATA / f"{job_id}-zh.srt"
+    subtitle_text = bilibili_provider.plain_subtitles(subtitle_path.read_text(encoding="utf-8-sig"))
+    meta = bilibili_provider.generate_meta(
+        api_key, load_config(DEEPSEEK_CONFIG), filename=job["filename"], subtitle_text=subtitle_text,
+        original_title=job.get("title") or "", source_url=job.get("source_url") or "")
+    settings = bilibili_provider.load_config(BILIBILI_CONFIG)
+    saved = _bilibili_view(job_id)
+    saved.update({**meta, "tid": int(saved.get("tid") or settings["tid"]),
+                  "tags": meta["tags"] or settings["tags"], "status": "ready",
+                  "message": meta.get("warning") or "已生成中文标题和简介", "error": ""})
+    bilibili_provider.save_job_meta(DATA / f"{job_id}-bilibili.json", saved)
+    return saved
+
+
+@app.put("/api/jobs/{job_id}/bilibili")
+def save_job_bilibili(job_id: str, body: BilibiliDraft):
+    get_job(job_id)
+    return _save_bilibili_draft(job_id, body, require_text=False)
+
+
+@app.post("/api/jobs/{job_id}/bilibili/publish")
+def publish_bilibili(job_id: str, body: BilibiliDraft):
+    job = get_job(job_id)
+    video = DATA / f"{job_id}-dubbed.mp4"
+    if not video.is_file():
+        raise HTTPException(409, "请先生成配音成片")
+    meta = _save_bilibili_draft(job_id, body, require_text=True)
+    source = (job.get("source_url") or "").strip()
+    meta["copyright"] = 1
+    meta["desc"] = bilibili_provider.append_source_link(meta["desc"], source)
+    bilibili_provider.save_job_meta(DATA / f"{job_id}-bilibili.json", meta)
+    cover = Path(job["upload_path"]).with_name("cover.jpg") if source else None
+
+    def load_cover():
+        if not source or cover is None:
+            return None
+        if not cover.is_file():
+            from ..pipeline.youtube import ensure_youtube_cover
+            ensure_youtube_cover(source, cover, YOUTUBE_CONFIG, YOUTUBE_COOKIES)
+        return cover if cover.is_file() else None
+
+    try:
+        bilibili_provider.start_publish(job_id, video, DATA / f"{job_id}-bilibili.json",
+                                        BILIBILI_COOKIES, meta, cover, load_cover if source else None)
+    except RuntimeError as exc:
+        raise HTTPException(409, str(exc)) from exc
+    return _bilibili_view(job_id)

@@ -552,6 +552,10 @@ class AzureDubbingTests(unittest.TestCase):
                          azure.clip_cache_key(segment, {**base, "engine": "azure"}, 1))
         self.assertNotEqual(azure.clip_cache_key(segment, base, 1),
                             azure.clip_cache_key(segment, {**base, "engine": "doubao"}, 1))
+        calm = {**base, "engine": "doubao", "calmness": 2}
+        flatter = {**calm, "calmness": 3}
+        self.assertNotEqual(azure.clip_cache_key(segment, calm, 1),
+                            azure.clip_cache_key(segment, flatter, 1))
 
     def test_elastic_timeline_shifts_later_voice_and_subtitles(self):
         segments = [{"id": "s1", "start": 0.5, "end": 1.5, "zh": "第一句"},

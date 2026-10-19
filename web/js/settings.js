@@ -6,7 +6,7 @@ $("#settings-grid").appendChild(azurePanel);
 const doubaoPanel = document.createElement("div");
 doubaoPanel.className = "panel upload-panel";
 doubaoPanel.id = "doubao-panel";
-doubaoPanel.innerHTML = `<div class="section-head"><h2>豆包语音模型</h2><span id="doubao-state">未配置</span></div><form id="doubao-form"><label>API Key<input id="doubao-key" type="password" autocomplete="new-password" placeholder="留空则保持现有密钥"></label><small class="setting-hint">使用火山引擎新版控制台的 API Key，保存在本机 Windows 凭据管理器。</small><label>资源 ID<select id="doubao-resource"></select></label><label>发音人<input id="doubao-speaker" list="doubao-speakers" spellcheck="false" placeholder="例如 zh_female_vv_uranus_bigtts"></label><datalist id="doubao-speakers"></datalist><small class="setting-hint" id="doubao-voice-note">2.0 音色需搭配 seed-tts-2.0。也可以填写已授权的自定义发音人 ID。</small><label>最大并发请求<input id="doubao-concurrency" type="number" min="1" max="8" step="1" value="1"></label><small class="setting-hint">速度与时间轴参数在下方独立设置，对 Azure 和豆包任务都生效。</small><div class="setting-actions"><button type="submit" class="primary">保存语音模型</button><button type="button" class="ghost" id="doubao-test">测试连接</button></div><button type="button" class="link-button" id="doubao-remove">移除已保存密钥</button><small class="setting-hint">测试连接会用当前发音人合成一句“测试。”。</small></form>`;
+doubaoPanel.innerHTML = `<div class="section-head"><h2>豆包语音模型</h2><span id="doubao-state">未配置</span></div><form id="doubao-form"><label>API Key<input id="doubao-key" type="password" autocomplete="new-password" placeholder="留空则保持现有密钥"></label><small class="setting-hint">使用火山引擎新版控制台的 API Key，保存在本机 Windows 凭据管理器。</small><label>资源 ID<select id="doubao-resource"></select></label><label>发音人<input id="doubao-speaker" list="doubao-speakers" spellcheck="false" placeholder="例如 zh_female_vv_uranus_bigtts"></label><datalist id="doubao-speakers"></datalist><small class="setting-hint" id="doubao-voice-note">2.0 音色需搭配 seed-tts-2.0。也可以填写已授权的自定义发音人 ID。</small><label>最大并发请求<input id="doubao-concurrency" type="number" min="1" max="8" step="1" value="1"></label><label>语气<select id="doubao-calmness"><option value="0">默认</option><option value="1">略平静</option><option value="2">平静</option><option value="3">很平静</option></select></label><small class="setting-hint">2.0 音色用语音指令压低情绪起伏，1.0 音色改用中性情感。数值越高越平。已合成的句子需要重新配音后才会改变。</small><small class="setting-hint">速度与时间轴参数在下方独立设置，对 Azure 和豆包任务都生效。</small><div class="setting-actions"><button type="submit" class="primary">保存语音模型</button><button type="button" class="ghost" id="doubao-test">测试连接</button></div><button type="button" class="link-button" id="doubao-remove">移除已保存密钥</button><small class="setting-hint">测试连接会用当前发音人合成一句“测试。”。</small></form>`;
 $("#settings-grid").appendChild(doubaoPanel);
 const timingPanel = document.createElement("div");
 timingPanel.className = "panel upload-panel";
@@ -295,6 +295,7 @@ function doubaoFormData() {
     resource_id: $("#doubao-resource").value,
     speaker: $("#doubao-speaker").value.trim(),
     concurrency: Number($("#doubao-concurrency").value),
+    calmness: Number($("#doubao-calmness").value),
   };
 }
 function setDoubaoChoices(config) {
@@ -328,6 +329,7 @@ async function loadDoubaoConfig() {
     setDoubaoChoices(c);
     $("#doubao-speaker").value = c.speaker;
     $("#doubao-concurrency").value = c.concurrency;
+    $("#doubao-calmness").value = String(c.calmness ?? 2);
     $("#doubao-key").value = "";
   } catch (e) {
     notify(e.message);
@@ -585,10 +587,55 @@ $("#youtube-remove-cookies").onclick = async () => {
   }
 };
 loadYouTubeConfig();
+const bilibiliPanel = document.createElement("div");
+bilibiliPanel.className = "panel upload-panel";
+bilibiliPanel.innerHTML = `<div class="section-head"><h2>B 站投稿</h2><span id="bilibili-state">读取中</span></div><form id="bilibili-settings-form"><label>Cookie<textarea id="bilibili-cookie" rows="4" placeholder="从浏览器复制 SESSDATA、bili_jct 等 Cookie"></textarea></label><small class="setting-hint">只保存在本机，页面不会回显 Cookie。需要 SESSDATA 和 bili_jct。</small><label>默认分区<select id="bilibili-tid"></select></label><label>默认标签<input id="bilibili-tags" placeholder="配音,翻译,教程"></label><div class="setting-actions"><button class="primary" type="submit">保存登录与分区</button><button class="ghost" type="button" id="bilibili-logout">退出登录</button></div></form>`;
+$("#settings-grid").appendChild(bilibiliPanel);
+async function loadBilibiliSettings() {
+  const [settings, status, partitions] = await Promise.all([
+    api("/api/bilibili/settings"), api("/api/bilibili/status"), api("/api/bilibili/partitions")]);
+  const groups = new Map();
+  for (const item of partitions) {
+    if (!groups.has(item.group)) groups.set(item.group, []);
+    groups.get(item.group).push(item);
+  }
+  $("#bilibili-tid").innerHTML = [...groups].map(([group, items]) =>
+    `<optgroup label="${esc(group)}">${items.map((item) => `<option value="${item.tid}">${esc(item.name)}</option>`).join("")}</optgroup>`).join("");
+  $("#bilibili-tid").value = String(settings.tid);
+  $("#bilibili-tags").value = settings.tags;
+  $("#bilibili-cookie").value = "";
+  $("#bilibili-state").textContent = status.logged_in ? `已登录 ${status.uname || ""}` : (status.message || "未登录");
+}
+$("#bilibili-settings-form").onsubmit = async (event) => {
+  event.preventDefault();
+  const button = event.submitter;
+  button.disabled = true;
+  try {
+    await api("/api/bilibili/settings", {method: "PUT", headers: {"Content-Type": "application/json"},
+      body: JSON.stringify({tid: Number($("#bilibili-tid").value), tags: $("#bilibili-tags").value})});
+    const cookie = $("#bilibili-cookie").value.trim();
+    if (cookie) {
+      await api("/api/bilibili/cookie", {method: "PUT", headers: {"Content-Type": "application/json"},
+        body: JSON.stringify({cookie})});
+    }
+    await loadBilibiliSettings();
+    notify(cookie ? "B 站登录与分区已保存" : "B 站分区已保存");
+  } catch (err) {
+    notify(err.message);
+  } finally {
+    button.disabled = false;
+  }
+};
+$("#bilibili-logout").onclick = async () => {
+  await api("/api/bilibili/cookie", {method: "DELETE"});
+  await loadBilibiliSettings();
+};
+loadBilibiliSettings();
 const settingsGrid = $("#settings-grid");
 for (const [panel, open] of [
   [$("#deepseek-form").closest(".panel"), true],
   [youtubePanel, false],
+  [bilibiliPanel, false],
   [azurePanel, false],
   [doubaoPanel, false],
   [timingPanel, false],

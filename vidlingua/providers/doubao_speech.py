@@ -28,7 +28,12 @@ VOICES = {
     "zh_female_shuangkuaisisi_moon_bigtts": "爽快思思 · 女声 · 1.0",
 }
 DEFAULTS = {"resource_id": "seed-tts-2.0", "speaker": "zh_female_vv_uranus_bigtts",
-            "concurrency": 1}
+            "concurrency": 1, "calmness": 2}
+CALM_INSTRUCTIONS = {
+    1: "语气平稳一些，情绪起伏小一点。",
+    2: "用平静、平稳的语气朗读，减少情绪起伏。",
+    3: "用非常平静、克制的语气平铺直叙，几乎不要情绪起伏。",
+}
 SYNTHESIS_MAX_ATTEMPTS = 5
 RETRYABLE_HTTP_STATUS = {408, 429, 500, 502, 503, 504}
 
@@ -52,8 +57,11 @@ def validate_config(config: dict) -> dict:
     concurrency = config["concurrency"]
     if isinstance(concurrency, bool) or int(concurrency) != concurrency or not 1 <= int(concurrency) <= 8:
         raise ValueError("豆包并发数必须在 1–8 之间")
+    calmness = config.get("calmness", 0)
+    if isinstance(calmness, bool) or int(calmness) != calmness or not 0 <= int(calmness) <= 3:
+        raise ValueError("豆包平静程度必须在 0–3 之间")
     return {**config, "resource_id": resource_id, "speaker": validate_speaker(str(config["speaker"])),
-            "concurrency": int(concurrency)}
+            "concurrency": int(concurrency), "calmness": int(calmness)}
 
 
 def save_config(path: Path, config: dict) -> None:
@@ -136,30 +144,45 @@ def pcm_to_wav(pcm: bytes) -> bytes:
     return output.getvalue()
 
 
+def _calm_fields(config: dict) -> tuple[dict, dict]:
+    """2.0 voices take a spoken instruction; 1.0 voices take a neutral emotion."""
+    level = int(config.get("calmness") or 0)
+    if level <= 0:
+        return {}, {}
+    level = min(3, level)
+    if str(config.get("resource_id") or "").startswith("seed-tts-1.0"):
+        return {"emotion": "neutral", "emotion_scale": 4 - level}, {}
+    return {}, {"context_texts": [CALM_INSTRUCTIONS[level]]}
+
+
 def synthesize(key: str, config: dict, text: str, rate: float = 1.0,
                annotations: list[dict] | None = None) -> bytes:
     del annotations
+    checked = validate_config(config)
+    audio_extra, addition_extra = _calm_fields(checked)
     payload = {
         "user": {"uid": "vidlingua"},
         "req_params": {
             "text": text,
-            "speaker": validate_speaker(config["speaker"]),
+            "speaker": checked["speaker"],
             "audio_params": {
                 "format": "pcm",
                 "sample_rate": SAMPLE_RATE,
                 "speech_rate": speech_rate(rate),
+                **audio_extra,
             },
             "additions": json.dumps({
                 "explicit_language": "zh-cn",
                 "max_length_to_filter_parenthesis": 0,
                 "disable_markdown_filter": True,
                 "silence_duration": 80,
+                **addition_extra,
             }, ensure_ascii=False),
         },
     }
     headers = {
         "X-Api-Key": validate_key(key),
-        "X-Api-Resource-Id": validate_config(config)["resource_id"],
+        "X-Api-Resource-Id": checked["resource_id"],
         "X-Api-Request-Id": str(uuid.uuid4()),
         "Content-Type": "application/json",
     }

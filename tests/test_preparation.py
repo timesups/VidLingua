@@ -84,6 +84,16 @@ class PreparationTests(unittest.TestCase):
         result = make_segments(self.make_transcript([source]), 21)
         self.assertEqual(len(result), 1)
 
+    def test_gap_candidates_ignore_quiet_interlude(self):
+        import numpy as np
+        from vidlingua.pipeline.transcribe import gap_candidates
+
+        audio = np.zeros(32 * 16000, dtype=np.float32)
+        audio[8 * 16000:15 * 16000] = .07
+        segments = [{"start": 0, "end": 2}, {"start": 16, "end": 19},
+                    {"start": 24, "end": 26}, {"start": 29, "end": 32}]
+        self.assertEqual(gap_candidates(segments, audio, 16000), [(2.0, 16.0)])
+
     def test_short_segment_keeps_original_timing(self):
         source = {"start": 0, "end": 4, "text": "A short sentence.",
                   "words": [{"word": "A", "start": 0.5, "end": 0.7},

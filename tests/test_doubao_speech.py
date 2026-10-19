@@ -45,9 +45,21 @@ class DoubaoSpeechTests(unittest.TestCase):
         self.assertEqual(sent["req_params"]["audio_params"]["format"], "pcm")
         self.assertEqual(sent["req_params"]["audio_params"]["sample_rate"], 24000)
         self.assertEqual(sent["req_params"]["speaker"], doubao.DEFAULTS["speaker"])
+        additions = json.loads(sent["req_params"]["additions"])
+        self.assertEqual(additions["context_texts"], [doubao.CALM_INSTRUCTIONS[2]])
+        self.assertNotIn("emotion", sent["req_params"]["audio_params"])
         self.assertEqual(post.call_args.kwargs["headers"]["X-Api-Resource-Id"], "seed-tts-2.0")
         self.assertEqual(post.call_args.kwargs["headers"]["X-Api-Key"], "12345678abcd")
         self.assertEqual(azure.read_wav(wav).tolist(), [1000, -1000])
+
+    def test_calmness_uses_instruction_or_neutral_emotion(self):
+        flat = {**doubao.DEFAULTS, "calmness": 0}
+        audio, additions = doubao._calm_fields(doubao.validate_config(flat))
+        self.assertEqual((audio, additions), ({}, {}))
+        older = doubao.validate_config({**doubao.DEFAULTS, "resource_id": "seed-tts-1.0", "calmness": 3})
+        audio, additions = doubao._calm_fields(older)
+        self.assertEqual(audio, {"emotion": "neutral", "emotion_scale": 1})
+        self.assertEqual(additions, {})
 
     def test_settings_do_not_echo_the_api_key(self):
         with tempfile.TemporaryDirectory() as directory, \

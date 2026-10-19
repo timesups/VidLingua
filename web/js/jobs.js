@@ -1,6 +1,46 @@
 let jobListData = [];
 let renderedJobTable = "";
 let previewSubtitleUrl = null;
+let previewPlayer = null;
+let finishedPlayer = null;
+const plyrText = {
+  restart: "重播", rewind: "后退 {seektime} 秒", play: "播放", pause: "暂停",
+  fastForward: "前进 {seektime} 秒", seek: "进度", seekLabel: "{currentTime} / {duration}",
+  played: "已播放", buffered: "已缓冲", currentTime: "当前时间", duration: "总时长",
+  volume: "音量", mute: "静音", unmute: "取消静音", enableCaptions: "显示字幕",
+  disableCaptions: "隐藏字幕", enterFullscreen: "全屏", exitFullscreen: "退出全屏",
+  frameTitle: "播放器", captions: "字幕", settings: "设置", speed: "倍速",
+  normal: "正常", quality: "画质", loop: "循环", disabled: "关闭", enabled: "开启",
+};
+function plyrOptions(controls) {
+  return {
+    iconUrl: "/static/vendor/plyr.svg",
+    controls,
+    seekTime: 5,
+    speed: { selected: 1, options: [0.5, 0.75, 1, 1.25, 1.5, 2] },
+    keyboard: { focused: true, global: false },
+    tooltips: { controls: true, seek: true },
+    captions: { active: true, language: "zh", update: true },
+    storage: { enabled: false },
+    i18n: plyrText,
+  };
+}
+function destroyPlayers() {
+  previewPlayer?.destroy();
+  finishedPlayer?.destroy();
+  previewPlayer = null;
+  finishedPlayer = null;
+}
+function mountPlayers() {
+  const video = $("#video");
+  if (!video?.isConnected || !window.Plyr) return;
+  previewPlayer = new Plyr(video, plyrOptions(["play-large", "play", "progress", "current-time", "duration", "captions", "settings", "fullscreen"]));
+  const toggle = $("#preview-subtitles");
+  previewPlayer.on("captionsenabled", () => { if (toggle) toggle.checked = true; });
+  previewPlayer.on("captionsdisabled", () => { if (toggle) toggle.checked = false; });
+  const finished = $("#finished-video");
+  if (finished) finishedPlayer = new Plyr(finished, plyrOptions(["play-large", "play", "progress", "current-time", "duration", "mute", "volume", "settings", "fullscreen"]));
+}
 
 function clearPreviewSubtitleUrl() {
   if (previewSubtitleUrl) URL.revokeObjectURL(previewSubtitleUrl);
@@ -330,12 +370,13 @@ async function refreshLog() {
   }
 }
 function renderDetail() {
+  destroyPlayers();
   clearPreviewSubtitleUrl();
   const j = current,
     info = stageInfo(j),
     step = info.index;
   $("#workspace").innerHTML =
-    `<div class="panel"><div class="work-head"><div><h2>${esc(j.title)}</h2><div class="muted">${esc(j.filename)}${j.media ? " · " + j.media.duration_seconds.toFixed(1) + " 秒 · " + j.media.primary_video.width + "×" + j.media.primary_video.height : ""}</div></div><span class="badge">${esc(jobLabel(j))}</span></div><div class="steps">${info.names.map((n, i) => `<div class="step ${i < step ? "done" : ""} ${i === info.separationIndex && !j.separate_vocals ? "skipped" : ""}"><b>${String(i + 1).padStart(2, "0")}</b>${i === info.separationIndex && !j.separate_vocals ? "跳过人声分离" : n}</div>`).join("")}</div><div class="progress-dashboard"><div class="progress-heading"><span>整体进度</span><strong id="overall-progress-text"></strong></div><progress id="overall-progress" max="100" value="0"></progress><div class="progress-heading"><span>当前阶段</span><strong id="stage-progress-text"></strong></div><progress id="stage-progress" max="100"></progress></div><div class="work-body">${j.error ? `<div class="alert">${esc(j.error)}</div>` : ""}<div class="action-row">${["created", "failed", "interrupted"].includes(j.status) ? '<button class="primary" id="run-btn">' + (j.status === "created" ? "开始处理" : "重试处理") + "</button>" : ""}<button class="ghost" id="rerun-btn" ${jobIsActive(j) ? "disabled" : ""}>重跑任务</button><button class="ghost danger" id="delete-job-btn" ${jobIsActive(j) ? "disabled" : ""}>删除任务</button><span class="muted">${j.segment_count} 个句段 · ${j.review_count} 个待复核</span>${j.status === "failed" ? '<button class="ghost" id="log-btn">查看日志</button>' : ""}</div><div id="detail-content"></div></div><section id="job-log" class="job-log"><div class="progress-heading"><h3>运行日志</h3><button class="ghost" id="refresh-log" type="button">刷新日志</button></div><pre id="job-log-output">正在读取日志…</pre></section></div>`;
+    `<div class="panel"><div class="work-head"><div><h2>${esc(j.title)}</h2><div class="muted">${esc(j.filename)}${j.media ? " · " + j.media.duration_seconds.toFixed(1) + " 秒 · " + j.media.primary_video.width + "×" + j.media.primary_video.height : ""}</div></div><span class="badge">${esc(jobLabel(j))}</span></div><div class="steps">${info.names.map((n, i) => `<div class="step ${i < step ? "done" : ""} ${i === info.separationIndex && !j.separate_vocals ? "skipped" : ""}"><b>${String(i + 1).padStart(2, "0")}</b>${i === info.separationIndex && !j.separate_vocals ? "跳过人声分离" : n}</div>`).join("")}</div><div class="progress-dashboard"><div class="progress-heading"><span>整体进度</span><strong id="overall-progress-text"></strong></div><progress id="overall-progress" max="100" value="0"></progress><div class="progress-heading"><span>当前阶段</span><strong id="stage-progress-text"></strong></div><progress id="stage-progress" max="100"></progress></div><div class="work-body">${j.error ? `<div class="alert">${esc(j.error)}</div>` : ""}<div class="action-row">${["created", "failed", "interrupted"].includes(j.status) ? '<button class="primary" id="run-btn">' + (j.status === "created" ? "开始处理" : "重试处理") + "</button>" : ""}<button class="ghost" id="rerun-btn" ${jobIsActive(j) ? "disabled" : ""}>重跑任务</button><button class="ghost danger" id="delete-job-btn" ${jobIsActive(j) ? "disabled" : ""}>删除任务</button><span class="muted">${j.segment_count} 个句段 · ${j.review_count} 个待复核</span>${j.status === "failed" ? '<button class="ghost" id="log-btn">查看日志</button>' : ""}</div><div id="detail-content"></div></div><section id="job-log" class="job-log"><div class="progress-heading"><h3>运行日志</h3><a class="ghost" href="/api/jobs/${active}/asr-diagnostics.json" download ${j.asr_diagnostics_available ? "" : "hidden"}>下载识别诊断</a><button class="ghost" id="refresh-log" type="button">刷新日志</button></div><pre id="job-log-output">正在读取日志…</pre></section></div>`;
   $("#run-btn")?.addEventListener("click", startRun);
   $("#rerun-btn").addEventListener("click", rerunCurrentJob);
   $("#delete-job-btn").addEventListener("click", deleteCurrentJob);
@@ -399,6 +440,7 @@ function renderEditor() {
   $("#translate-btn").closest(".translation-panel").after(dubbingPanel);
   $("#dub-btn").onclick = startDubbing;
   renderDubbingReport();
+  if (j.translation_status === "done") renderBilibili(j);
   $("#translate-btn").onclick = startTranslation;
   $("#translate-btn").disabled =
     !["ready", "prepared"].includes(j.status) ||
@@ -415,8 +457,14 @@ function renderEditor() {
   if (subtitleToggle) subtitleToggle.onchange = () => {
     const track = video.querySelector("track[data-preview-subtitles]");
     if (track) track.track.mode = subtitleToggle.checked ? "showing" : "disabled";
+    if (previewPlayer) previewPlayer.currentTrack = subtitleToggle.checked ? 0 : -1;
   };
-  loadPreviewSubtitles();
+  video.onratechange = () => {
+    audio.playbackRate = video.playbackRate;
+  };
+  loadPreviewSubtitles().finally(() => {
+    if ($("#video")?.isConnected) mountPlayers();
+  });
   const finishedVideo = $("#finished-video");
   if (finishedVideo)
     finishedVideo.onplay = () => {
@@ -521,6 +569,102 @@ function dubbingStatusText(j) {
       interrupted: "配音中断，可重试。",
     }[j.dubbing_status] || "尚未配音"
   );
+}
+function renderBilibili(job) {
+  const panel = document.createElement("div");
+  panel.className = "subpanel translation-panel";
+  panel.innerHTML = `<h3>B 站投稿</h3><p class="muted">根据中文字幕生成标题、简介和标签。分区和动态按设置自动填写；YouTube 视频只在简介末尾附上原地址。成片完成后可投稿。</p><p id="bili-status">正在读取</p><progress id="bili-progress" max="100" value="0" hidden></progress><label>中文标题<input id="bili-title" maxlength="80"></label><label>简介<textarea id="bili-desc" maxlength="2000" rows="8"></textarea></label><label>标签<input id="bili-tags" placeholder="配音,翻译,教程"></label><div class="action-row"><button class="primary" type="button" id="bili-generate">生成标题和简介</button><button class="ghost" type="button" id="bili-save">保存</button><button class="primary" type="button" id="bili-publish" ${job.dubbing_status === "done" ? "" : "disabled"}>投稿到 B 站</button></div>`;
+  $("#dub-btn").closest(".translation-panel").after(panel);
+  $("#bili-generate").onclick = generateBilibiliMeta;
+  $("#bili-save").onclick = () => saveBilibiliDraft(false);
+  $("#bili-publish").onclick = publishBilibili;
+  loadBilibiliDraft();
+}
+function biliDraftBody() {
+  return {title: $("#bili-title").value, desc: $("#bili-desc").value, tags: $("#bili-tags").value};
+}
+function showBilibiliProgress(meta) {
+  const bar = $("#bili-progress");
+  const status = $("#bili-status");
+  if (!status) return;
+  const uploading = meta.status === "uploading";
+  const percent = Math.max(0, Math.min(100, Number(meta.progress) || 0));
+  if (bar) {
+    bar.hidden = !uploading;
+    bar.value = percent;
+  }
+  const link = meta.bvid ? ` https://www.bilibili.com/video/${meta.bvid}` : "";
+  status.textContent = `${meta.message || (uploading ? "正在投稿" : "尚未生成标题和简介")}${uploading ? ` ${percent}%` : ""}${link}${meta.error ? " " + meta.error : ""}`;
+}
+function fillBilibili(meta) {
+  $("#bili-title").value = meta.title || "";
+  $("#bili-desc").value = meta.desc || "";
+  $("#bili-tags").value = meta.tags || "";
+  showBilibiliProgress(meta);
+}
+async function loadBilibiliDraft() {
+  try {
+    const meta = await api(`/api/jobs/${active}/bilibili`);
+    if (!$("#bili-title")) return;
+    fillBilibili(meta);
+    if (meta.status === "uploading") pollBilibili();
+  } catch (e) {
+    if ($("#bili-status")) $("#bili-status").textContent = e.message;
+  }
+}
+async function generateBilibiliMeta() {
+  const button = $("#bili-generate");
+  button.disabled = true;
+  $("#bili-status").textContent = "正在生成中文标题和简介…";
+  try {
+    const meta = await api(`/api/jobs/${active}/bilibili/meta`, {method: "POST"});
+    fillBilibili(meta);
+    if (meta.warning) notify(meta.warning);
+  } catch (e) {
+    $("#bili-status").textContent = e.message;
+    notify(e.message);
+  } finally {
+    button.disabled = false;
+  }
+}
+async function saveBilibiliDraft(quiet) {
+  const meta = await api(`/api/jobs/${active}/bilibili`, {method: "PUT", headers: {"Content-Type": "application/json"}, body: JSON.stringify(biliDraftBody())});
+  fillBilibili(meta);
+  if (!quiet) $("#bili-status").textContent = "标题和简介已保存";
+  return meta;
+}
+async function publishBilibili() {
+  const button = $("#bili-publish");
+  button.disabled = true;
+  showBilibiliProgress({status: "uploading", progress: 0, message: "准备投稿"});
+  try {
+    const meta = await api(`/api/jobs/${active}/bilibili/publish`, {method: "POST", headers: {"Content-Type": "application/json"}, body: JSON.stringify(biliDraftBody())});
+    fillBilibili(meta);
+    pollBilibili();
+  } catch (e) {
+    notify(e.message);
+    showBilibiliProgress({status: "error", message: "投稿失败", error: e.message});
+    button.disabled = current?.dubbing_status !== "done";
+  }
+}
+function pollBilibili() {
+  if (pollBilibili.timer) clearInterval(pollBilibili.timer);
+  pollBilibili.timer = setInterval(async () => {
+    if (!$("#bili-status") || !active) {
+      clearInterval(pollBilibili.timer);
+      return;
+    }
+    try {
+      const meta = await api(`/api/jobs/${active}/bilibili`);
+      showBilibiliProgress(meta);
+      if (meta.status !== "uploading") {
+        clearInterval(pollBilibili.timer);
+        if ($("#bili-publish")) $("#bili-publish").disabled = current?.dubbing_status !== "done";
+      }
+    } catch (e) {
+      clearInterval(pollBilibili.timer);
+    }
+  }, 800);
 }
 async function renderDubbingReport() {
   if (!current.dubbing_report_available) return;
@@ -792,7 +936,6 @@ $("#upload-form").onsubmit = async (e) => {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           url: youtubeUrl.value.trim(),
-          title: e.target.elements.title.value.trim(),
           separate_vocals,
           dubbing_engine,
         }),

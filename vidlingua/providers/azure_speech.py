@@ -288,6 +288,8 @@ def clip_cache_key(segment: dict, config: dict, rate: float) -> str:
     value = [segment["id"], segment["zh"], config["region"], config["voice"], rate]
     if (config.get("engine") or "azure") != "azure":
         value.append(config["engine"])
+        if config.get("engine") == "doubao":
+            value.append(int(config.get("calmness") or 0))
     if is_hd_voice(config["voice"]):
         value.append(config.get("hd_temperature", DEFAULTS["hd_temperature"]))
     if segment.get("pronunciations"):

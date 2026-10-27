@@ -63,7 +63,7 @@ def validate_config(config: dict) -> dict:
     for name, low, high in (("max_synthesis_adjust", 0, .1),
                             ("hd_temperature", .3, 1),
                             ("max_post_adjust", 0, .75), ("max_global_adjust", 0, .3),
-                            ("max_local_adjust", 0, .25), ("max_video_adjust", 0, .5),
+                            ("max_local_adjust", 0, 1), ("max_video_adjust", 0, .5),
                             ("background_volume", 0, 1)):
         if not low <= float(config[name]) <= high:
             raise ValueError(f"{name} 必须在 {low}–{high} 之间")
@@ -679,6 +679,18 @@ def _retime_filter(pieces: list[dict], background_volume: float,
     return ";".join(video_parts + audio_parts)
 
 
+def _coalesce_retime_pieces(pieces: list[dict]) -> list[dict]:
+    """Keep the same timing while avoiding one FFmpeg trim node per subtitle gap."""
+    merged = []
+    for piece in pieces:
+        if (merged and abs(float(merged[-1]["end"]) - float(piece["start"])) < 1e-6
+                and abs(float(merged[-1]["speed"]) - float(piece["speed"])) < 1e-6):
+            merged[-1]["end"] = piece["end"]
+        else:
+            merged.append(dict(piece))
+    return merged
+
+
 def render_video(source_video: Path, instrumental: Path | None, voice: Path, destination: Path,
                  duration: float, background_volume: float, pieces: list[dict] | None = None,
                  watermark: dict | None = None, subtitles: dict | None = None,
@@ -704,6 +716,8 @@ def render_video(source_video: Path, instrumental: Path | None, voice: Path, des
         textfile.unlink(missing_ok=True)
         raise
     video_vf = ",".join(filter(None, (subtitle_vf, watermark_vf)))
+    original_piece_count = len(pieces or [])
+    pieces = _coalesce_retime_pieces(pieces or [])
     retime = bool(pieces) and any(abs(float(piece["speed"]) - 1) >= .001 for piece in pieces)
     inputs = ["-i", str(source_video)]
     if instrumental is not None:
@@ -715,7 +729,7 @@ def render_video(source_video: Path, instrumental: Path | None, voice: Path, des
 
     def encoder_options(encoder: str) -> list[str]:
         if encoder == "h264_nvenc":
-            return ["-c:v", "h264_nvenc", "-preset", "p5", "-tune", "hq",
+            return ["-c:v", "h264_nvenc", "-preset", "p4", "-tune", "hq",
                     "-rc", "vbr", "-cq", "18", "-b:v", "0", "-pix_fmt", "yuv420p"]
         if encoder == "libx264":
             return ["-c:v", "libx264", "-preset", "veryfast", "-crf", "18",
@@ -752,11 +766,14 @@ def render_video(source_video: Path, instrumental: Path | None, voice: Path, des
     encoders = ("h264_nvenc", "libx264") if needs_encode else ("copy",)
     errors = []
     try:
+        if original_piece_count:
+            log(f"视频调速片段：{original_piece_count} 段，合并相邻同速片段后 {len(pieces)} 段")
         for encoder in encoders:
             command = ["ffmpeg", "-hide_banner", "-loglevel", "error", "-nostdin", "-y",
                        *inputs, *filters, *maps, *encoder_options(encoder), "-c:a", "aac",
                        "-t", str(duration), str(temporary)]
             log(f"视频编码：{encoder}，开始合成")
+            started = time.perf_counter()
             try:
                 result = subprocess.run(command, capture_output=True, text=True, check=False,
                                         cwd=destination.parent)
@@ -766,9 +783,10 @@ def render_video(source_video: Path, instrumental: Path | None, voice: Path, des
                 raise RuntimeError("未找到 FFmpeg，无法合成视频") from exc
             if result.returncode == 0 and temporary.is_file() and temporary.stat().st_size > 0:
                 temporary.replace(destination)
-                log(f"视频编码：{encoder}，合成完成")
+                log(f"视频编码：{encoder}，合成完成，耗时 {time.perf_counter() - started:.1f} 秒")
                 return encoder
             errors.append(f"{encoder}: {result.stderr[-700:]}")
+            log(f"视频编码：{encoder}，失败，耗时 {time.perf_counter() - started:.1f} 秒")
             temporary.unlink(missing_ok=True)
             if encoder == "h264_nvenc":
                 log("NVENC 合成失败，改用 CPU 编码重试")

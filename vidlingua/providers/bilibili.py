@@ -59,9 +59,7 @@ def save_config(path: Path, config: dict) -> None:
     tid = int(config["tid"])
     if tid not in PARTITION_TIDS:
         raise ValueError("请选择支持的投稿分区")
-    tags = tag_text(config.get("tags") or DEFAULTS["tags"])
-    if not tags:
-        raise ValueError("请至少填写一个标签")
+    tags = tag_text(config.get("tags", DEFAULTS["tags"]))
     path.parent.mkdir(parents=True, exist_ok=True)
     temporary = path.with_suffix(".tmp")
     temporary.write_text(json.dumps({"tid": tid, "tags": tags}, ensure_ascii=False, indent=2),
@@ -112,7 +110,15 @@ def clear_cookies(path: Path) -> None:
         path.unlink()
 
 
+def _validate_cookie_values(cookies: dict[str, str]) -> None:
+    invalid = [name for name, value in cookies.items() if not value.isascii()]
+    if invalid:
+        raise ValueError("Cookie 值含非 ASCII 字符（" + "、".join(invalid)
+                         + "）；可能复制了被省略的值，请重新粘贴完整 Cookie")
+
+
 def _session(cookies: dict[str, str]) -> requests.Session:
+    _validate_cookie_values(cookies)
     session = requests.Session()
     session.trust_env = False
     session.headers.update({
@@ -142,12 +148,9 @@ def save_cookie_login(cookie_path: Path, raw: str) -> dict:
     missing = [name for name in ("SESSDATA", "bili_jct") if not cookies.get(name)]
     if missing:
         raise ValueError("缺少必要 Cookie：" + "、".join(missing))
+    _validate_cookie_values(cookies)
     save_cookies(cookie_path, cookies)
-    status = login_status(cookie_path)
-    if not status["logged_in"]:
-        clear_cookies(cookie_path)
-        raise ValueError(status.get("message") or "Cookie 无效或已过期")
-    return status
+    return {"saved": True, "message": "Cookie 已保存，正在单独验证登录状态"}
 
 
 def plain_subtitles(srt: str) -> str:
@@ -236,13 +239,14 @@ def generate_meta(api_key: str, config: dict, *, filename: str, subtitle_text: s
 
 
 def empty_meta(settings: dict) -> dict:
-    return {"title": "", "desc": "", "tags": settings.get("tags") or DEFAULTS["tags"],
+    return {"title": "", "desc": "", "tags": settings.get("tags", DEFAULTS["tags"]),
             "dynamic": "", "tid": int(settings.get("tid") or DEFAULTS["tid"]),
             "status": "idle", "progress": 0, "message": "", "bvid": "", "aid": "", "error": ""}
 
 
 def load_job_meta(path: Path, settings: dict) -> dict:
     meta = empty_meta(settings)
+    saved = {}
     if path.is_file():
         saved = json.loads(path.read_text(encoding="utf-8"))
         if isinstance(saved, dict):
@@ -251,6 +255,12 @@ def load_job_meta(path: Path, settings: dict) -> dict:
         live = _uploads.get(path.stem.removesuffix("-bilibili"))
     if live:
         meta.update(live)
+    elif meta["status"] == "uploading":
+        interrupted = {"status": "error", "message": "投稿已中断",
+                       "error": "服务重启中断了上传，请重新投稿"}
+        meta.update(interrupted)
+        saved.update(interrupted)
+        save_job_meta(path, saved)
     return meta
 
 
@@ -295,6 +305,16 @@ def _upload_file(session: requests.Session, video_path: Path, progress) -> dict:
         "name": filename, "size": filesize, "r": "upos", "profile": "ugcupos/bup",
         "ssl": "0", "version": "2.14.0", "build": "2140000", "webVersion": "2.14.0",
     }, timeout=30)
+    if pre.status_code in (401, 403):
+        detail = ""
+        if "json" in pre.headers.get("Content-Type", ""):
+            try:
+                payload = pre.json()
+                detail = str(payload.get("message") or payload.get("msg") or "")[:160]
+            except (ValueError, AttributeError):
+                pass
+        raise RuntimeError(f"B 站拒绝申请上传通道（HTTP {pre.status_code}）"
+                           + (f"：{detail}" if detail else "；请检查登录 Cookie 是否有效，以及账号投稿权限"))
     pre.raise_for_status()
     info = pre.json()
     if "upos_uri" not in info:

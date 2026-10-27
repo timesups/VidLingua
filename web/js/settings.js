@@ -11,7 +11,7 @@ $("#settings-grid").appendChild(doubaoPanel);
 const timingPanel = document.createElement("div");
 timingPanel.className = "panel upload-panel";
 timingPanel.id = "timing-panel";
-timingPanel.innerHTML = `<div class="section-head"><h2>速度与时间轴</h2><span>Azure / 豆包共用</span></div><form id="timing-form"><small class="setting-hint">基于全片语音时长确定统一基准，再逐句微调。剩余时长差由画面调速吸收；豆包语音不使用服务端合成提速。</small><label>全片自动基准提速上限<input id="azure-global-adjust" type="number" min="0" max="0.30" step="0.01" value="0.08"></label><label>逐句相对基准提速上限<input id="azure-local-adjust" type="number" min="0" max="0.25" step="0.01" value="0.05"></label><label>音频后处理总上限<input id="azure-post-adjust" type="number" min="0" max="0.75" step="0.01" value="0.15"></label><label>单句画面调速上限<input id="azure-video-adjust" type="number" min="0" max="0.50" step="0.01" value="0.18"></label><small class="setting-hint">设置值是相对 1 倍速度的调整幅度。例如 0.18 表示画面最多加快或放慢 18%。配音长于画面时放慢，短于画面时加快。</small><label>背景音音量<input id="azure-background-volume" type="number" min="0" max="1" step="0.05" value="0.55"></label><button type="submit" class="primary">保存速度与时间轴</button></form>`;
+timingPanel.innerHTML = `<div class="section-head"><h2>速度与时间轴</h2><span>Azure / 豆包共用</span></div><form id="timing-form"><small class="setting-hint">基于全片语音时长确定统一基准，再逐句微调。剩余时长差由画面调速吸收；豆包语音不使用服务端合成提速。</small><label>全片自动基准提速上限<input id="azure-global-adjust" type="number" min="0" max="0.30" step="0.01" value="0.08"></label><label>逐句相对基准提速上限<input id="azure-local-adjust" type="number" min="0" max="1" step="0.01" value="0.05"></label><label>音频后处理总上限<input id="azure-post-adjust" type="number" min="0" max="0.75" step="0.01" value="0.15"></label><label>单句画面调速上限<input id="azure-video-adjust" type="number" min="0" max="0.50" step="0.01" value="0.18"></label><small class="setting-hint">设置值是相对 1 倍速度的调整幅度。例如 0.18 表示画面最多加快或放慢 18%。配音长于画面时放慢，短于画面时加快。</small><label>背景音音量<input id="azure-background-volume" type="number" min="0" max="1" step="0.05" value="0.55"></label><button type="submit" class="primary">保存速度与时间轴</button></form>`;
 $("#settings-grid").appendChild(timingPanel);
 $("#settings-grid").prepend($("#deepseek-form").closest(".panel"));
 async function loadDeepSeekConfig() {
@@ -390,6 +390,7 @@ setInterval(async () => {
   try {
     await refreshList();
     await refreshDetail();
+    await refreshBatch();
   } catch (e) {
     console.error(e);
   }
@@ -435,22 +436,33 @@ $("#watermark-form").onsubmit = async (e) => {
   }
 };
 let returnHash = "#";
+let playbackRoute = location.hash;
+function stopWorkspacePlayback() {
+  document.querySelectorAll("#workspace video, #workspace audio").forEach((media) => media.pause());
+}
 function syncPage() {
   const hash = location.hash;
+  if (hash !== playbackRoute) stopWorkspacePlayback();
+  playbackRoute = hash;
   const settings = hash === "#settings";
   const jobId = hash.startsWith("#job/") ? hash.slice(5) : null;
+  const batchId = hash.startsWith("#batch/") ? hash.slice(7) : null;
   const main = document.querySelector("main");
   main.classList.toggle("settings-open", settings);
-  main.classList.toggle("detail-open", !!jobId);
-  main.classList.toggle("home-open", !settings && !jobId);
+  main.classList.toggle("detail-open", !!jobId || !!batchId);
+  main.classList.toggle("home-open", !settings && !jobId && !batchId);
   $("#settings-page").hidden = !settings;
-  $("#home-toggle").hidden = !jobId;
+  $("#home-toggle").hidden = !jobId && !batchId;
+  $("#home-toggle").textContent = jobId && current?.batch_id ? "← 批处理任务" : "← 任务列表";
   $("#settings-toggle").textContent = settings ? "← 返回" : "⚙ 设置";
   $("#settings-toggle").setAttribute("aria-expanded", String(settings));
   if (jobId && active !== jobId)
     selectJob(jobId).catch((e) => notify(e.message));
-  if (!jobId && !settings) {
+  if (batchId && activeBatch !== batchId)
+    selectBatch(batchId).catch((e) => notify(e.message));
+  if (!jobId && !batchId && !settings) {
     active = null;
+    activeBatch = null;
     $$(".job-row").forEach((item) => item.classList.remove("active"));
   }
 }
@@ -463,9 +475,14 @@ $("#settings-toggle").onclick = () => {
   }
 };
 $("#home-toggle").onclick = () => {
-  location.hash = "#";
+  location.hash = location.hash.startsWith("#job/") && current?.batch_id
+    ? `batch/${current.batch_id}` : "#";
 };
 window.addEventListener("hashchange", syncPage);
+window.addEventListener("pagehide", stopWorkspacePlayback);
+document.addEventListener("visibilitychange", () => {
+  if (document.hidden) stopWorkspacePlayback();
+});
 syncPage();
 loadWatermarkConfig();
 
@@ -589,11 +606,23 @@ $("#youtube-remove-cookies").onclick = async () => {
 loadYouTubeConfig();
 const bilibiliPanel = document.createElement("div");
 bilibiliPanel.className = "panel upload-panel";
-bilibiliPanel.innerHTML = `<div class="section-head"><h2>B 站投稿</h2><span id="bilibili-state">读取中</span></div><form id="bilibili-settings-form"><label>Cookie<textarea id="bilibili-cookie" rows="4" placeholder="从浏览器复制 SESSDATA、bili_jct 等 Cookie"></textarea></label><small class="setting-hint">只保存在本机，页面不会回显 Cookie。需要 SESSDATA 和 bili_jct。</small><label>默认分区<select id="bilibili-tid"></select></label><label>默认标签<input id="bilibili-tags" placeholder="配音,翻译,教程"></label><div class="setting-actions"><button class="primary" type="submit">保存登录与分区</button><button class="ghost" type="button" id="bilibili-logout">退出登录</button></div></form>`;
+bilibiliPanel.innerHTML = `<div class="section-head"><h2>B 站投稿</h2><span id="bilibili-state">读取中</span></div><form id="bilibili-settings-form"><label>Cookie<textarea id="bilibili-cookie" rows="4" placeholder="从浏览器复制 SESSDATA、bili_jct 等 Cookie"></textarea></label><small class="setting-hint">只保存在本机，页面不会回显 Cookie。需要 SESSDATA 和 bili_jct。</small><label>默认分区<select id="bilibili-tid"><option>正在加载分区…</option></select></label><label>默认标签<input id="bilibili-tags" placeholder="配音,翻译,教程"></label><div class="setting-actions"><button class="primary" type="submit">保存登录与分区</button><button class="ghost" type="button" id="bilibili-logout">退出登录</button></div></form>`;
 $("#settings-grid").appendChild(bilibiliPanel);
+let bilibiliStatusSeq = 0;
+async function refreshBilibiliStatus() {
+  const seq = ++bilibiliStatusSeq;
+  try {
+    const status = await api("/api/bilibili/status");
+    if (seq !== bilibiliStatusSeq) return;
+    $("#bilibili-state").textContent = status.logged_in
+      ? `已登录 ${status.uname || ""}` : (status.message || "未登录");
+  } catch (error) {
+    if (seq === bilibiliStatusSeq) $("#bilibili-state").textContent = error.message;
+  }
+}
 async function loadBilibiliSettings() {
-  const [settings, status, partitions] = await Promise.all([
-    api("/api/bilibili/settings"), api("/api/bilibili/status"), api("/api/bilibili/partitions")]);
+  const [settings, partitions] = await Promise.all([
+    api("/api/bilibili/settings"), api("/api/bilibili/partitions")]);
   const groups = new Map();
   for (const item of partitions) {
     if (!groups.has(item.group)) groups.set(item.group, []);
@@ -604,7 +633,7 @@ async function loadBilibiliSettings() {
   $("#bilibili-tid").value = String(settings.tid);
   $("#bilibili-tags").value = settings.tags;
   $("#bilibili-cookie").value = "";
-  $("#bilibili-state").textContent = status.logged_in ? `已登录 ${status.uname || ""}` : (status.message || "未登录");
+  void refreshBilibiliStatus();
 }
 $("#bilibili-settings-form").onsubmit = async (event) => {
   event.preventDefault();
@@ -617,6 +646,8 @@ $("#bilibili-settings-form").onsubmit = async (event) => {
     if (cookie) {
       await api("/api/bilibili/cookie", {method: "PUT", headers: {"Content-Type": "application/json"},
         body: JSON.stringify({cookie})});
+      bilibiliStatusSeq++;
+      $("#bilibili-state").textContent = "Cookie 已保存，正在验证登录…";
     }
     await loadBilibiliSettings();
     notify(cookie ? "B 站登录与分区已保存" : "B 站分区已保存");
@@ -630,7 +661,10 @@ $("#bilibili-logout").onclick = async () => {
   await api("/api/bilibili/cookie", {method: "DELETE"});
   await loadBilibiliSettings();
 };
-loadBilibiliSettings();
+loadBilibiliSettings().catch((error) => {
+  $("#bilibili-tid").innerHTML = '<option value="">分区加载失败</option>';
+  notify(error.message);
+});
 const settingsGrid = $("#settings-grid");
 for (const [panel, open] of [
   [$("#deepseek-form").closest(".panel"), true],

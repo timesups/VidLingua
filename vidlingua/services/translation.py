@@ -6,13 +6,14 @@ from __future__ import annotations
 def correct_packet(context, job_id: str, key: str, config: dict, packet: dict, source_digest: str) -> dict:
     CORRECTION_VERSION = context.CORRECTION_VERSION
     DATA = context.DATA
-    ThreadPoolExecutor = context.ThreadPoolExecutor
     as_completed = context.as_completed
     copy = context.copy
     correct_english_group = context.correct_english_group
     json = context.json
     make_english_srt = context.make_english_srt
     update_job = context.update_job
+    check_pause = context.check_pause
+    check_pause(job_id)
     path = DATA / f"{job_id}-corrected-english.json"
     result = {"correction_version": CORRECTION_VERSION, "source_sha256": source_digest,
               "model": config["model"], "groups": [], "usage": {}}
@@ -29,13 +30,14 @@ def correct_packet(context, job_id: str, key: str, config: dict, packet: dict, s
     pending = [(index, group) for index, group in enumerate(packet["groups"])
                if group["id"] not in completed]
     first_error = None
-    with ThreadPoolExecutor(max_workers=int(config["concurrency"])) as pool:
+    with context.pause_aware_pool(max_workers=int(config["concurrency"])) as pool:
         futures = {}
         for index, group in pending:
             next_context = (packet["groups"][index + 1]["segments"][0]["edited_text"]
                             if index + 1 < len(packet["groups"]) else "")
             futures[pool.submit(correct_english_group, key, config, packet, group, next_context)] = group["id"]
         for future in as_completed(futures):
+            check_pause(job_id)
             try:
                 corrected, usage = future.result()
             except Exception as exc:
@@ -43,10 +45,16 @@ def correct_packet(context, job_id: str, key: str, config: dict, packet: dict, s
                     first_error = exc
                 continue
             result["groups"].append({"id": futures[future], "segments": corrected, "usage": usage})
+            if usage.get("retry_diagnostics"):
+                with (DATA / f"{job_id}.log").open("a", encoding="utf-8") as log:
+                    log.write(f"英文校正 {futures[future]}：" + "；".join(usage["retry_diagnostics"]) +
+                              ("；重试后仍不完整，已沿用原英文并标记待复核\n"
+                               if usage.get("correction_fallback") else "；重试成功\n"))
             for name in ("prompt_tokens", "completion_tokens", "total_tokens"):
                 result["usage"][name] = result["usage"].get(name, 0) + usage.get(name, 0)
             path.write_text(json.dumps(result, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
             update_job(job_id, translation_progress=len(result["groups"]))
+    check_pause(job_id)
     if first_error is not None:
         raise first_error
     indexed = {group["id"]: group for group in result["groups"]}
@@ -75,7 +83,6 @@ def translate_job(context, job_id: str):
     DEEPSEEK_CONFIG = context.DEEPSEEK_CONFIG
     GLOSSARY_VERSION = context.GLOSSARY_VERSION
     TRANSLATION_VERSION = context.TRANSLATION_VERSION
-    ThreadPoolExecutor = context.ThreadPoolExecutor
     as_completed = context.as_completed
     correct_packet = context.correct_packet
     get_api_key = context.get_api_key
@@ -88,7 +95,9 @@ def translate_job(context, job_id: str):
     refine_glossary = context.refine_glossary
     translate_group = context.translate_group
     update_job = context.update_job
+    check_pause = context.check_pause
     try:
+        check_pause(job_id)
         key = get_api_key()
         if not key:
             raise RuntimeError("尚未配置 DeepSeek API Key")
@@ -111,6 +120,7 @@ def translate_job(context, job_id: str):
                        translation_total=len(packet["groups"]), translation_error="")
             candidates = glossary_candidates(packet)
             subject, auto_terms, usage = refine_glossary(key, config, packet, candidates)
+            check_pause(job_id)
             merged = [f"{item['en']} = {item['zh']}" for item in auto_terms]
             glossary = {"glossary_version": GLOSSARY_VERSION, "source_sha256": digest,
                         "model": config["model"], "subject": subject,
@@ -139,10 +149,11 @@ def translate_job(context, job_id: str):
                    translation_total=len(packet["groups"]), translation_error="")
         pending = [group for group in packet["groups"] if group["id"] not in completed]
         first_error = None
-        with ThreadPoolExecutor(max_workers=int(config["concurrency"])) as pool:
+        with context.pause_aware_pool(max_workers=int(config["concurrency"])) as pool:
             futures = {pool.submit(translate_group, key, config, packet, group): group["id"]
                        for group in pending}
             for future in as_completed(futures):
+                check_pause(job_id)
                 try:
                     translated, usage = future.result()
                 except Exception as exc:
@@ -154,6 +165,7 @@ def translate_job(context, job_id: str):
                     output["usage"][key_name] = output["usage"].get(key_name, 0) + usage.get(key_name, 0)
                 output_path.write_text(json.dumps(output, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
                 update_job(job_id, translation_progress=len(output["groups"]))
+        check_pause(job_id)
         if first_error is not None:
             raise first_error
         indexed = {group["id"]: group for group in output["groups"]}
@@ -163,6 +175,8 @@ def translate_job(context, job_id: str):
         (DATA / f"{job_id}-bilingual.srt").write_text(make_bilingual_srt(items), encoding="utf-8-sig")
         output_path.write_text(json.dumps(output, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
         update_job(job_id, stage="synthesize", translation_status="done", translation_error="")
+    except context.PauseRequested:
+        context.mark_paused(job_id)
     except Exception as exc:
         update_job(job_id, translation_status="failed", translation_error=str(exc))
 

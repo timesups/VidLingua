@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import os
 import re
+import time
 from collections import Counter
 from pathlib import Path
 
@@ -119,17 +120,47 @@ def correct_english_group(api_key: str, config: dict, packet: dict, group: dict,
                  '{"segments":[{"id":"s0001","en":"Corrected English sentence.","uncertain":false}]}. '
                  "Return every supplied ID exactly once in the same order."},
                 {"role": "user", "content": json.dumps(payload, ensure_ascii=False)}]
-    for attempt in range(2):
-        response = call_deepseek(api_key, config, messages)
-        items = response["content"].get("segments") if isinstance(response["content"], dict) else None
-        if isinstance(items, list) and [item.get("id") for item in items if isinstance(item, dict)] == expected:
-            if all(isinstance(item.get("en"), str) and item["en"].strip() for item in items):
+    diagnostics = []
+    usage = {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0}
+    for attempt in range(4):
+        try:
+            response = call_deepseek(api_key, config, messages)
+        except RuntimeError as exc:
+            if not any(marker in str(exc) for marker in ("响应未完整结束", "返回空内容", "不是有效 JSON")):
+                raise
+            issue = f"响应格式异常：{exc}"
+        else:
+            request_usage = response.get("usage") or {}
+            for name in ("prompt_tokens", "completion_tokens", "total_tokens"):
+                usage[name] += int(request_usage.get(name) or 0)
+            items = response["content"].get("segments") if isinstance(response["content"], dict) else None
+            actual = [item.get("id") if isinstance(item, dict) else None for item in items] if isinstance(items, list) else []
+            missing = [item_id for item_id in expected if item_id not in actual]
+            extra = [item_id for item_id in actual if item_id not in expected]
+            blank = [item.get("id") for item in items if isinstance(item, dict) and
+                     (not isinstance(item.get("en"), str) or not item["en"].strip())] if isinstance(items, list) else []
+            if isinstance(items, list) and actual == expected and not blank:
+                usage["retry_count"] = attempt
+                if diagnostics:
+                    usage["retry_diagnostics"] = diagnostics
                 return ([{"id": item["id"], "en": " ".join(item["en"].split()),
-                          "uncertain": bool(item.get("uncertain"))} for item in items], response["usage"])
-        if attempt == 0:
-            messages.append({"role": "user", "content": "Return corrected JSON with these IDs in order: "
-                             + ", ".join(expected)})
-    raise RuntimeError(f"组 {group['id']} 的英文校正 ID 或正文不完整")
+                          "uncertain": bool(item.get("uncertain"))} for item in items], usage)
+            issue = (f"缺少 {missing or '无'}；多出 {extra or '无'}；空正文 {blank or '无'}；"
+                     f"顺序{'正确' if actual == expected else '不符'}") if isinstance(items, list) else "缺少 segments 数组"
+        diagnostics.append(f"第 {attempt + 1} 次：{issue}")
+        if attempt < 3:
+            # Rebuild from the original request so an incomplete answer cannot anchor the next one.
+            messages = messages[:2] + [{"role": "user", "content":
+                f"Your previous output was incomplete ({issue}). Return one non-empty English sentence for EVERY ID, "
+                "in exactly this order. Keep fragments as separate items; do not merge them. "
+                "Use the original text if you cannot confidently correct it. Original items: "
+                + json.dumps(payload["segments"], ensure_ascii=False)}]
+            time.sleep(min(0.4 * (2 ** attempt), 1.6))
+    # English correction is optional. Preserve the ASR text and flag it for review
+    # instead of stopping translation because a model repeatedly omits one item.
+    usage.update(retry_count=3, retry_diagnostics=diagnostics, correction_fallback=True)
+    return ([{"id": item["id"], "en": item["edited_text"], "uncertain": True}
+             for item in group["segments"]], usage)
 
 
 def clean_pronunciations(chinese: str, value: object) -> list[dict]:

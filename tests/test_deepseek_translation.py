@@ -98,6 +98,43 @@ class DeepSeekTranslationTests(unittest.TestCase):
         self.assertIn("Now compile the shader.", call.call_args.args[2][1]["content"])
         self.assertIn("We use a vertex shader.", call.call_args.args[2][1]["content"])
 
+    def test_english_correction_retries_missing_id_and_records_diagnostics(self):
+        packet = {"title": "Lecture"}
+        group = {"id": "g155", "previous_context": "", "segments": [
+            {"id": "s0509", "edited_text": "We have an HDR."},
+            {"id": "s0510", "edited_text": "environment map here."}]}
+        incomplete = {"content": {"segments": [{"id": "s0509", "en": "We have an HDR.", "uncertain": False}]},
+                      "usage": {"total_tokens": 10}}
+        complete = {"content": {"segments": [
+            {"id": "s0509", "en": "We have an HDR", "uncertain": False},
+            {"id": "s0510", "en": "environment map here.", "uncertain": False}]},
+            "usage": {"total_tokens": 12}}
+        with patch.object(deepseek, "call_deepseek", side_effect=[incomplete, complete]) as call, \
+             patch.object(deepseek.time, "sleep"):
+            corrected, usage = deepseek.correct_english_group("key", deepseek.DEFAULTS, packet, group)
+        self.assertEqual(call.call_count, 2)
+        self.assertEqual([item["id"] for item in corrected], ["s0509", "s0510"])
+        self.assertEqual(usage["total_tokens"], 22)
+        self.assertEqual(usage["retry_count"], 1)
+        self.assertIn("s0510", usage["retry_diagnostics"][0])
+
+    def test_english_correction_falls_back_after_bounded_retries(self):
+        packet = {"title": "Lecture"}
+        group = {"id": "g155", "previous_context": "", "segments": [
+            {"id": "s0509", "edited_text": "We have an HDR."},
+            {"id": "s0510", "edited_text": "environment map here."}]}
+        incomplete = {"content": {"segments": [{"id": "s0509", "en": "We have an HDR."}]},
+                      "usage": {"total_tokens": 10}}
+        with patch.object(deepseek, "call_deepseek", return_value=incomplete) as call, \
+             patch.object(deepseek.time, "sleep"):
+            corrected, usage = deepseek.correct_english_group("key", deepseek.DEFAULTS, packet, group)
+        self.assertEqual(call.call_count, 4)
+        self.assertEqual([item["en"] for item in corrected],
+                         ["We have an HDR.", "environment map here."])
+        self.assertTrue(all(item["uncertain"] for item in corrected))
+        self.assertTrue(usage["correction_fallback"])
+        self.assertEqual(len(usage["retry_diagnostics"]), 4)
+
     def test_pronunciation_annotations_are_validated(self):
         annotations = deepseek.clean_pronunciations("银行账户", [
             {"text": "行", "pinyin": "hang2", "alias": "航"},

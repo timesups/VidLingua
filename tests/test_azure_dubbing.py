@@ -26,6 +26,16 @@ def sample_wav(seconds: float) -> bytes:
 
 
 class AzureDubbingTests(unittest.TestCase):
+    def test_adjacent_equal_speed_pieces_are_coalesced_without_changing_timing(self):
+        pieces = [{"start": 0, "end": 1, "speed": 1.0},
+                  {"start": 1, "end": 2, "speed": 1.0},
+                  {"start": 2, "end": 3, "speed": 1.1},
+                  {"start": 3, "end": 4, "speed": 1.1}]
+        merged = azure._coalesce_retime_pieces(pieces)
+        self.assertEqual(merged, [{"start": 0, "end": 2, "speed": 1.0},
+                                  {"start": 2, "end": 4, "speed": 1.1}])
+        self.assertEqual(pieces[0]["end"], 1)
+
     def test_azure_settings_accept_key_pool_without_echoing_keys(self):
         with tempfile.TemporaryDirectory() as directory, \
              patch.object(web_app, "AZURE_CONFIG", Path(directory) / "azure.json"), \
@@ -221,7 +231,7 @@ class AzureDubbingTests(unittest.TestCase):
         self.assertLessEqual(timings[0]["post_speed"], 1.75)
 
     def test_other_visible_speed_limits_accept_new_maxima(self):
-        limits = {"max_global_adjust": 0.30, "max_local_adjust": 0.25,
+        limits = {"max_global_adjust": 0.30, "max_local_adjust": 1.0,
                   "max_video_adjust": 0.50}
         azure.validate_config({**azure.DEFAULTS, **limits})
         for name, maximum in limits.items():

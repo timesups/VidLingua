@@ -140,7 +140,9 @@ def make_segments(transcript_path: Path, duration: float) -> list[dict]:
             flags.append("invalid_time")
         if end - start > 12:
             flags.append("long_segment")
-        if not words or any(not isinstance(w.get("start"), (int, float)) or not isinstance(w.get("end"), (int, float)) for w in words):
+        if (source.get("origin") != "external_subtitle" and
+                (not words or any(not isinstance(w.get("start"), (int, float)) or
+                                  not isinstance(w.get("end"), (int, float)) for w in words))):
             flags.append("missing_word_time")
         if any(w.get("score", 1) < 0.55 for w in words):
             flags.append("low_alignment_score")

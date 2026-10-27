@@ -3,6 +3,7 @@ let renderedJobTable = "";
 let previewSubtitleUrl = null;
 let previewPlayer = null;
 let finishedPlayer = null;
+let finishedFullscreenFallback = false;
 const plyrText = {
   restart: "重播", rewind: "后退 {seektime} 秒", play: "播放", pause: "暂停",
   fastForward: "前进 {seektime} 秒", seek: "进度", seekLabel: "{currentTime} / {duration}",
@@ -26,11 +27,43 @@ function plyrOptions(controls) {
   };
 }
 function destroyPlayers() {
+  setFinishedFullscreenFallback(false);
   previewPlayer?.destroy();
   finishedPlayer?.destroy();
   previewPlayer = null;
   finishedPlayer = null;
 }
+function setFinishedFullscreenFallback(enabled) {
+  finishedFullscreenFallback = enabled;
+  finishedPlayer?.elements.container?.classList.toggle("finished-fullscreen-fallback", enabled);
+  document.documentElement.classList.toggle("finished-fullscreen-open", enabled);
+  const button = $("#finished-fullscreen");
+  if (button) button.textContent = enabled ? "退出全屏" : "全屏预览";
+}
+async function toggleFinishedFullscreen() {
+  const container = finishedPlayer?.elements.container;
+  if (!container) return;
+  if (finishedFullscreenFallback) {
+    setFinishedFullscreenFallback(false);
+    return;
+  }
+  if (document.fullscreenElement === container) {
+    await document.exitFullscreen();
+    return;
+  }
+  try {
+    if (!container.requestFullscreen) throw new Error("不支持系统全屏");
+    await container.requestFullscreen();
+  } catch {
+    setFinishedFullscreenFallback(true);
+  }
+}
+document.addEventListener("keydown", (event) => {
+  if (event.key === "Escape" && finishedFullscreenFallback) {
+    setFinishedFullscreenFallback(false);
+    event.preventDefault();
+  }
+});
 function mountPlayers() {
   const video = $("#video");
   if (!video?.isConnected || !window.Plyr) return;
@@ -39,7 +72,15 @@ function mountPlayers() {
   previewPlayer.on("captionsenabled", () => { if (toggle) toggle.checked = true; });
   previewPlayer.on("captionsdisabled", () => { if (toggle) toggle.checked = false; });
   const finished = $("#finished-video");
-  if (finished) finishedPlayer = new Plyr(finished, plyrOptions(["play-large", "play", "progress", "current-time", "duration", "mute", "volume", "settings", "fullscreen"]));
+  if (finished) {
+    finishedPlayer = new Plyr(finished, plyrOptions(["play-large", "play", "progress", "current-time", "duration", "mute", "volume", "settings", "fullscreen"]));
+    finishedPlayer.elements.container?.querySelector('[data-plyr="fullscreen"]')?.addEventListener("click", (event) => {
+      event.preventDefault();
+      event.stopImmediatePropagation();
+      toggleFinishedFullscreen();
+    }, true);
+    $("#finished-fullscreen")?.addEventListener("click", toggleFinishedFullscreen);
+  }
 }
 
 function clearPreviewSubtitleUrl() {
@@ -84,17 +125,23 @@ async function loadPreviewSubtitles(jobId = active) {
 }
 const selectedJobIds = new Set();
 const jobIsActive = (j) =>
-  ["queued", "running"].includes(j.status) ||
+  (j.kind === "batch" ? j.status === "running" : ["queued", "running"].includes(j.status)) ||
+  Boolean(j.pause_requested && j.status !== "paused") ||
   ["queued", "correcting", "glossary", "running"].includes(j.translation_status) ||
   ["queued", "running"].includes(j.dubbing_status);
 function jobMatchesStatus(j, status) {
-  if (status === "done") return j.dubbing_status === "done";
+  if (j.kind === "batch") {
+    if (status === "done") return j.status === "done" && !jobHasFailure(j);
+    if (status === "active") return j.status === "running";
+    if (status === "review") return jobNeedsReview(j);
+    if (status === "failed") return jobHasFailure(j);
+    if (status === "other") return j.status === "created";
+  }
+  if (status === "done") return j.dubbing_status === "done" && !jobHasFailure(j);
   if (status === "active") return jobIsActive(j);
-  if (status === "review") return j.dubbing_status === "needs_review" || j.status === "ready";
+  if (status === "review") return jobNeedsReview(j);
   if (status === "failed")
-    return [j.status, j.translation_status, j.dubbing_status].some((value) =>
-      ["failed", "interrupted"].includes(value),
-    );
+    return jobHasFailure(j) || [j.status, j.translation_status, j.dubbing_status].includes("interrupted");
   if (status === "other")
     return !["done", "active", "review", "failed"].some((value) => jobMatchesStatus(j, value));
   return true;
@@ -115,9 +162,10 @@ function renderJobTable() {
     : "未选择任务";
   $("#bulk-rerun").disabled = $("#bulk-delete").disabled =
     !selectedJobIds.size || selectedJobIds.size > 100;
-  const allVisibleSelected = jobs.length > 0 && jobs.every((j) => selectedJobIds.has(j.id));
+  const selectable = jobs.filter((j) => j.kind !== "batch" || j.supports_actions);
+  const allVisibleSelected = selectable.length > 0 && selectable.every((j) => selectedJobIds.has(j.id));
   const html = jobs.length
-    ? `<div class="job-table-scroll"><table class="job-table"><thead><tr><th><input id="select-visible-jobs" type="checkbox" aria-label="选择当前检索结果" ${allVisibleSelected ? "checked" : ""}></th><th>任务</th><th>状态</th><th>来源</th><th>配音</th><th>创建时间</th><th></th></tr></thead><tbody>${jobs.map((j) => `<tr class="job-row ${j.id === active ? "active" : ""}" data-id="${esc(j.id)}"><td><input type="checkbox" data-select-job="${esc(j.id)}" aria-label="选择 ${esc(j.title)}" ${selectedJobIds.has(j.id) ? "checked" : ""}></td><td><button class="job-title" type="button" data-open-job="${esc(j.id)}">${esc(j.title)}</button><small>${esc(j.filename)}</small></td><td><span class="job-state ${jobIsActive(j) ? "is-active" : ""}">${esc(jobLabel(j))}</span></td><td>${j.source_url ? "YouTube" : "本地视频"}</td><td>${j.dubbing_engine === "doubao" ? "豆包" : "Azure"}</td><td>${j.created_at && !Number.isNaN(Date.parse(j.created_at)) ? esc(new Date(j.created_at).toLocaleString("zh-CN")) : "—"}</td><td><button class="ghost" type="button" data-open-job="${esc(j.id)}">查看</button></td></tr>`).join("")}</tbody></table></div>`
+    ? `<div class="job-table-scroll"><table class="job-table"><thead><tr><th><input id="select-visible-jobs" type="checkbox" aria-label="选择当前检索结果" ${allVisibleSelected ? "checked" : ""}></th><th>任务</th><th>状态</th><th>来源</th><th>配音</th><th>创建时间</th><th></th></tr></thead><tbody>${jobs.map((j) => `<tr class="job-row ${j.id === active ? "active" : ""}" data-id="${esc(j.id)}"><td><input type="checkbox" data-select-job="${esc(j.id)}" aria-label="选择 ${esc(j.title)}" ${j.kind === "batch" && !j.supports_actions ? "disabled" : selectedJobIds.has(j.id) ? "checked" : ""}></td><td><button class="job-title" type="button" data-open-job="${esc(j.id)}">${esc(j.title)}</button><small>${esc(j.filename)}${j.kind === "batch" ? ` · ${j.completed}/${j.count} 已完成` : ""}</small></td><td><span class="job-state ${jobIsActive(j) ? "is-active" : ""} ${jobNeedsReview(j) ? "is-review" : ""} ${jobHasFailure(j) ? "is-failed" : ""}">${esc(jobLabel(j))}</span></td><td>${j.kind === "batch" ? "批处理" : j.source_url ? "YouTube" : "本地视频"}</td><td>${j.kind === "batch" ? `${j.completed}/${j.count}` : j.dubbing_engine === "doubao" ? "豆包" : "Azure"}</td><td>${j.created_at && !Number.isNaN(Date.parse(j.created_at)) ? esc(new Date(j.created_at).toLocaleString("zh-CN")) : "—"}</td><td><button class="ghost" type="button" data-open-job="${esc(j.id)}">查看</button></td></tr>`).join("")}</tbody></table></div>`
     : '<p class="muted job-empty">没有符合条件的任务。</p>';
   if (renderedJobTable !== html) {
     $("#job-list").innerHTML = html;
@@ -134,14 +182,19 @@ $("#job-search").addEventListener("input", renderJobTable);
 $("#job-status-filter").addEventListener("change", renderJobTable);
 $("#job-list").addEventListener("click", (event) => {
   const button = event.target.closest("[data-open-job]");
-  if (button) location.hash = `job/${button.dataset.openJob}`;
+  if (button) {
+    const job = jobListData.find((item) => item.id === button.dataset.openJob);
+    location.hash = `${job?.kind === "batch" ? "batch" : "job"}/${button.dataset.openJob}`;
+  }
 });
 $("#job-list").addEventListener("change", (event) => {
   if (event.target.id === "select-visible-jobs") {
-    for (const job of visibleJobs())
+    for (const job of visibleJobs().filter((item) => item.kind !== "batch" || item.supports_actions))
       if (event.target.checked) selectedJobIds.add(job.id);
       else selectedJobIds.delete(job.id);
   } else if (event.target.dataset.selectJob) {
+    const job = jobListData.find((item) => item.id === event.target.dataset.selectJob);
+    if (!job || (job.kind === "batch" && !job.supports_actions)) return;
     if (event.target.checked) selectedJobIds.add(event.target.dataset.selectJob);
     else selectedJobIds.delete(event.target.dataset.selectJob);
   }
@@ -177,16 +230,19 @@ function $$(s, root = document) {
   return [...root.querySelectorAll(s)];
 }
 async function selectJob(id) {
+  activeBatch = null;
   active = id;
   signature = "";
   packet = null;
   await refreshList();
   await refreshDetail(true);
+  $("#home-toggle").textContent = current?.batch_id ? "← 批处理任务" : "← 任务列表";
 }
 const jobSignature = (job) =>
   [
     job.id,
     job.status,
+    job.pause_requested,
     job.segment_count,
     job.review_count,
     job.error,
@@ -194,6 +250,7 @@ const jobSignature = (job) =>
     job.translation_error,
     job.dubbing_status,
     job.dubbing_error,
+    job.cover_path,
     job.english_correction_ready,
     job.dubbed_video_available,
   ].join("|");
@@ -307,7 +364,10 @@ function updateLiveProgress() {
       ["correcting", "glossary", "running"].includes(j.translation_status) ||
       j.dubbing_status === "running";
   const badge = $(".work-head .badge");
-  if (badge) badge.textContent = jobLabel(j);
+  if (badge) {
+    badge.textContent = jobLabel(j);
+    badge.classList.toggle("is-failed", jobHasFailure(j));
+  }
   $$(".step").forEach((node, i) => {
     node.classList.toggle("done", i < step);
     node.classList.toggle(
@@ -376,8 +436,33 @@ function renderDetail() {
     info = stageInfo(j),
     step = info.index;
   $("#workspace").innerHTML =
-    `<div class="panel"><div class="work-head"><div><h2>${esc(j.title)}</h2><div class="muted">${esc(j.filename)}${j.media ? " · " + j.media.duration_seconds.toFixed(1) + " 秒 · " + j.media.primary_video.width + "×" + j.media.primary_video.height : ""}</div></div><span class="badge">${esc(jobLabel(j))}</span></div><div class="steps">${info.names.map((n, i) => `<div class="step ${i < step ? "done" : ""} ${i === info.separationIndex && !j.separate_vocals ? "skipped" : ""}"><b>${String(i + 1).padStart(2, "0")}</b>${i === info.separationIndex && !j.separate_vocals ? "跳过人声分离" : n}</div>`).join("")}</div><div class="progress-dashboard"><div class="progress-heading"><span>整体进度</span><strong id="overall-progress-text"></strong></div><progress id="overall-progress" max="100" value="0"></progress><div class="progress-heading"><span>当前阶段</span><strong id="stage-progress-text"></strong></div><progress id="stage-progress" max="100"></progress></div><div class="work-body">${j.error ? `<div class="alert">${esc(j.error)}</div>` : ""}<div class="action-row">${["created", "failed", "interrupted"].includes(j.status) ? '<button class="primary" id="run-btn">' + (j.status === "created" ? "开始处理" : "重试处理") + "</button>" : ""}<button class="ghost" id="rerun-btn" ${jobIsActive(j) ? "disabled" : ""}>重跑任务</button><button class="ghost danger" id="delete-job-btn" ${jobIsActive(j) ? "disabled" : ""}>删除任务</button><span class="muted">${j.segment_count} 个句段 · ${j.review_count} 个待复核</span>${j.status === "failed" ? '<button class="ghost" id="log-btn">查看日志</button>' : ""}</div><div id="detail-content"></div></div><section id="job-log" class="job-log"><div class="progress-heading"><h3>运行日志</h3><a class="ghost" href="/api/jobs/${active}/asr-diagnostics.json" download ${j.asr_diagnostics_available ? "" : "hidden"}>下载识别诊断</a><button class="ghost" id="refresh-log" type="button">刷新日志</button></div><pre id="job-log-output">正在读取日志…</pre></section></div>`;
+    `<div class="panel"><div class="work-head"><div><h2>${esc(j.title)}</h2><div class="muted">${esc(j.filename)}${j.media ? " · " + j.media.duration_seconds.toFixed(1) + " 秒 · " + j.media.primary_video.width + "×" + j.media.primary_video.height : ""}</div></div><span class="badge ${jobHasFailure(j) ? "is-failed" : ""}">${esc(jobLabel(j))}</span></div><div class="steps">${info.names.map((n, i) => `<div class="step ${i < step ? "done" : ""} ${i === info.separationIndex && !j.separate_vocals ? "skipped" : ""}"><b>${String(i + 1).padStart(2, "0")}</b>${i === info.separationIndex && !j.separate_vocals ? "跳过人声分离" : n}</div>`).join("")}</div><div class="progress-dashboard"><div class="progress-heading"><span>整体进度</span><strong id="overall-progress-text"></strong></div><progress id="overall-progress" max="100" value="0"></progress><div class="progress-heading"><span>当前阶段</span><strong id="stage-progress-text"></strong></div><progress id="stage-progress" max="100"></progress></div><div class="work-body">${j.error ? `<div class="alert">${esc(j.error)}</div>` : ""}<div class="action-row">${["created", "failed", "interrupted"].includes(j.status) ? '<button class="primary" id="run-btn">' + (j.status === "created" ? "开始处理" : "重试处理") + "</button>" : ""}${j.pause_requested !== undefined && jobIsActive(j) ? `<button class="ghost" id="pause-btn" ${j.pause_requested ? "disabled" : ""}>${j.pause_requested ? "正在暂停…" : "暂停任务"}</button>` : ""}${j.status === "paused" ? '<button class="primary" id="resume-btn">继续任务</button>' : ""}<button class="ghost" id="rerun-btn" ${jobIsActive(j) ? "disabled" : ""}>重跑任务</button><button class="ghost danger" id="delete-job-btn" ${jobIsActive(j) ? "disabled" : ""}>删除任务</button><span class="muted">${j.segment_count} 个句段 · ${j.review_count} 个待复核</span>${jobHasFailure(j) ? '<button class="ghost" id="log-btn">查看日志</button>' : ""}</div><div id="detail-content"></div></div><section id="job-log" class="job-log"><div class="progress-heading"><h3>运行日志</h3><a class="ghost" href="/api/jobs/${active}/asr-diagnostics.json" download ${j.asr_diagnostics_available ? "" : "hidden"}>下载识别诊断</a><button class="ghost" id="refresh-log" type="button">刷新日志</button></div><pre id="job-log-output">正在读取日志…</pre></section></div>`;
+  if (j.batch_id && j.batch_output_path) {
+    const output = document.createElement("p");
+    output.className = "muted";
+    output.textContent = `批处理成片输出位置（完成后）：${j.batch_output_path}`;
+    $("#workspace .work-body .action-row").after(output);
+  }
+  if (j.source_url) {
+    const button = document.createElement("button");
+    button.type = "button";
+    button.className = "ghost";
+    button.textContent = "复制封面路径";
+    button.disabled = !j.cover_path;
+    button.title = j.cover_path || "YouTube 封面尚未下载完成";
+    button.onclick = async () => {
+      try {
+        await navigator.clipboard.writeText(j.cover_path);
+        button.textContent = "已复制封面路径";
+      } catch (error) {
+        notify(`复制失败：${error.message}`);
+      }
+    };
+    $("#workspace .work-body .action-row").appendChild(button);
+  }
   $("#run-btn")?.addEventListener("click", startRun);
+  $("#pause-btn")?.addEventListener("click", pauseCurrentJob);
+  $("#resume-btn")?.addEventListener("click", resumeCurrentJob);
   $("#rerun-btn").addEventListener("click", rerunCurrentJob);
   $("#delete-job-btn").addEventListener("click", deleteCurrentJob);
   $("#log-btn")?.addEventListener("click", showLog);
@@ -385,6 +470,7 @@ function renderDetail() {
   if (
     j.status === "running" ||
     j.status === "queued" ||
+    (j.status === "paused" && !j.segment_count) ||
     j.status === "created" ||
     j.status === "interrupted" ||
     (j.status === "failed" && !segments.length)
@@ -407,7 +493,7 @@ function renderEditor() {
   if (j.dubbed_video_available) {
     const preview = document.createElement("section");
     preview.className = "subpanel finished-preview";
-    preview.innerHTML = `<h3>成片预览</h3><video id="finished-video" controls playsinline preload="metadata" src="/api/jobs/${active}/preview.mp4"></video><p>包含中文配音和成片字幕设置；可拖动进度查看。</p>`;
+    preview.innerHTML = `<div class="finished-preview-head"><h3>成片预览</h3><button class="ghost" id="finished-fullscreen" type="button">全屏预览</button></div><video id="finished-video" controls playsinline preload="metadata" src="/api/jobs/${active}/preview.mp4"></video><p>包含中文配音和成片字幕设置；可拖动进度查看。</p>`;
     $("#detail-content").prepend(preview);
     mountManualEdit(active, preview);
   }
@@ -441,7 +527,7 @@ function renderEditor() {
   $("#translate-btn").closest(".translation-panel").after(dubbingPanel);
   $("#dub-btn").onclick = startDubbing;
   renderDubbingReport();
-  if (j.translation_status === "done") renderBilibili(j);
+  if (j.translation_status === "done" && !j.batch_id) renderBilibili(j);
   $("#translate-btn").onclick = startTranslation;
   $("#translate-btn").disabled =
     !["ready", "prepared"].includes(j.status) ||
@@ -574,7 +660,7 @@ function dubbingStatusText(j) {
 function renderBilibili(job) {
   const panel = document.createElement("div");
   panel.className = "subpanel translation-panel";
-  panel.innerHTML = `<h3>B 站投稿</h3><p class="muted">根据中文字幕生成标题、简介和标签。分区和动态按设置自动填写；YouTube 视频只在简介末尾附上原地址。成片完成后可投稿。</p><p id="bili-status">正在读取</p><progress id="bili-progress" max="100" value="0" hidden></progress><label>中文标题<input id="bili-title" maxlength="80"></label><label>简介<textarea id="bili-desc" maxlength="2000" rows="8"></textarea></label><label>标签<input id="bili-tags" placeholder="配音,翻译,教程"></label><div class="action-row"><button class="primary" type="button" id="bili-generate">生成标题和简介</button><button class="ghost" type="button" id="bili-save">保存</button><button class="primary" type="button" id="bili-publish" ${job.dubbing_status === "done" ? "" : "disabled"}>投稿到 B 站</button></div>`;
+  panel.innerHTML = `<h3>B 站投稿</h3><p class="muted">根据中文字幕生成标题、简介和标签。YouTube 视频会在简介末尾附上原地址。成片完成后可投稿。</p><p id="bili-status">正在读取</p><progress id="bili-progress" max="100" value="0" hidden></progress><label>中文标题<input id="bili-title" maxlength="80"></label><label>简介<textarea id="bili-desc" maxlength="2000" rows="8"></textarea></label><label>分区<select id="bili-tid"></select></label><label>标签<input id="bili-tags" placeholder="配音,翻译,教程"></label><div class="action-row"><button class="primary" type="button" id="bili-generate">生成标题和简介</button><button class="ghost" type="button" id="bili-save">保存</button><button class="primary" type="button" id="bili-publish" ${job.dubbing_status === "done" ? "" : "disabled"}>投稿到 B 站</button></div>`;
   $("#dub-btn").closest(".translation-panel").after(panel);
   $("#bili-generate").onclick = generateBilibiliMeta;
   $("#bili-save").onclick = () => saveBilibiliDraft(false);
@@ -582,7 +668,8 @@ function renderBilibili(job) {
   loadBilibiliDraft();
 }
 function biliDraftBody() {
-  return {title: $("#bili-title").value, desc: $("#bili-desc").value, tags: $("#bili-tags").value};
+  return {title: $("#bili-title").value, desc: $("#bili-desc").value,
+    tags: $("#bili-tags").value, tid: Number($("#bili-tid").value) || null};
 }
 function showBilibiliProgress(meta) {
   const bar = $("#bili-progress");
@@ -601,12 +688,21 @@ function fillBilibili(meta) {
   $("#bili-title").value = meta.title || "";
   $("#bili-desc").value = meta.desc || "";
   $("#bili-tags").value = meta.tags || "";
+  if ($("#bili-tid")?.options.length) $("#bili-tid").value = String(meta.tid);
   showBilibiliProgress(meta);
 }
 async function loadBilibiliDraft() {
   try {
-    const meta = await api(`/api/jobs/${active}/bilibili`);
+    const [meta, partitions] = await Promise.all([
+      api(`/api/jobs/${active}/bilibili`), api("/api/bilibili/partitions")]);
     if (!$("#bili-title")) return;
+    const groups = new Map();
+    for (const item of partitions) {
+      if (!groups.has(item.group)) groups.set(item.group, []);
+      groups.get(item.group).push(item);
+    }
+    $("#bili-tid").innerHTML = [...groups].map(([group, items]) =>
+      `<optgroup label="${esc(group)}">${items.map((item) => `<option value="${item.tid}">${esc(item.name)}</option>`).join("")}</optgroup>`).join("");
     fillBilibili(meta);
     if (meta.status === "uploading") pollBilibili();
   } catch (e) {
@@ -847,6 +943,24 @@ async function startRun() {
     notify(e.message);
   }
 }
+async function pauseCurrentJob() {
+  try {
+    await api(`/api/jobs/${active}/pause`, { method: "POST" });
+    await refreshDetail(true);
+    await refreshList();
+  } catch (e) {
+    notify(e.message);
+  }
+}
+async function resumeCurrentJob() {
+  try {
+    await api(`/api/jobs/${active}/resume`, { method: "POST" });
+    await refreshDetail(true);
+    await refreshList();
+  } catch (e) {
+    notify(e.message);
+  }
+}
 async function rerunCurrentJob() {
   if (!confirm(`确定从译前句段开始重跑“${current.title}”？现有字幕、翻译与成片会重新生成。`)) return;
   try {
@@ -866,6 +980,7 @@ async function rerunCurrentJob() {
 async function deleteCurrentJob() {
   if (!confirm(`确定删除“${current.title}”及其专属文件？此操作不可撤销。`)) return;
   const id = active;
+  const batchId = current?.batch_id;
   try {
     for (const media of [$("#finished-video"), $("#video"), $("#audio")]) {
       if (!media) continue;
@@ -876,7 +991,7 @@ async function deleteCurrentJob() {
     await api(`/api/jobs/${id}`, { method: "DELETE" });
     selectedJobIds.delete(id);
     active = null;
-    location.hash = "#";
+    location.hash = batchId ? `batch/${batchId}` : "#";
     await refreshList();
   } catch (e) {
     notify(e.message);
@@ -888,26 +1003,51 @@ async function showLog() {
 }
 const drop = $("#drop"),
   file = $("#file"),
-  youtubeUrl = $("#youtube-url");
+  youtubeUrl = $("#youtube-url"),
+  batchPath = $("#batch-path");
 let selectedSource = "local";
 function setSource(source) {
   selectedSource = source;
   const isYoutube = source === "youtube";
-  drop.hidden = isYoutube;
+  const isBatch = source === "batch";
+  drop.hidden = isYoutube || isBatch;
   $("#youtube-panel").hidden = !isYoutube;
-  file.required = !isYoutube;
+  $("#local-publish-option").hidden = isYoutube || isBatch;
+  $("#youtube-publish-option").hidden = !isYoutube;
+  $("#batch-panel").hidden = !isBatch;
+  $("#pick-batch-folder").hidden = !isBatch;
+  file.required = !isYoutube && !isBatch;
   youtubeUrl.required = isYoutube;
-  file.disabled = isYoutube;
+  batchPath.required = isBatch;
+  file.disabled = isYoutube || isBatch;
   youtubeUrl.disabled = !isYoutube;
+  batchPath.disabled = !isBatch;
   $$(".source-tabs button").forEach((button) =>
     button.classList.toggle("selected", button.dataset.source === source),
   );
-  $("#create-btn").innerHTML = `${isYoutube ? "下载并开始处理" : "导入并开始处理"} <span>→</span>`;
+  $("#create-btn").innerHTML = `${isBatch ? "创建批处理任务" : isYoutube ? "下载并开始处理" : "导入并开始处理"} <span>→</span>`;
 }
 $$(".source-tabs button").forEach((button) =>
   button.addEventListener("click", () => setSource(button.dataset.source)),
 );
 setSource("local");
+$("#pick-batch-folder").onclick = async () => {
+  const button = $("#pick-batch-folder");
+  button.disabled = true;
+  button.textContent = "等待选择文件夹…";
+  try {
+    const result = await api("/api/batches/select-folder", { method: "POST" });
+    if (result.path) {
+      batchPath.value = result.path;
+      batchPath.focus();
+    }
+  } catch (error) {
+    notify(error.message);
+  } finally {
+    button.disabled = false;
+    button.textContent = "选择文件夹…";
+  }
+};
 file.onchange = () => {
   $("#file-label").textContent = file.files[0]?.name || "选择或拖入课程视频";
 };
@@ -931,6 +1071,18 @@ $("#upload-form").onsubmit = async (e) => {
     const separate_vocals = e.target.elements.separate_vocals.checked;
     const dubbing_engine = e.target.elements.dubbing_engine.value;
     let job;
+    if (selectedSource === "batch") {
+      const batch = await api("/api/batches", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ path: batchPath.value.trim(), separate_vocals, dubbing_engine }),
+      });
+      location.hash = `batch/${batch.id}`;
+      await selectBatch(batch.id);
+      e.target.reset();
+      setSource("local");
+      return;
+    }
     if (selectedSource === "youtube") {
       job = await api("/api/jobs/youtube", {
         method: "POST",
@@ -939,16 +1091,22 @@ $("#upload-form").onsubmit = async (e) => {
           url: youtubeUrl.value.trim(),
           separate_vocals,
           dubbing_engine,
+          publish_to_bilibili: $("#youtube-publish").checked,
         }),
       });
     } else {
       const data = new FormData(e.target);
       data.set("separate_vocals", separate_vocals ? "true" : "false");
+      data.set("publish_to_bilibili", $("#local-publish").checked ? "true" : "false");
       job = await api("/api/jobs", { method: "POST", body: data });
     }
     location.hash = `job/${job.id}`;
     await selectJob(job.id);
-    await startRun();
+    if (job.already_exists) {
+      notify("该 YouTube 视频已有任务，已打开现有任务。若需重新处理，请在任务详情中点击重跑任务。");
+    } else {
+      await startRun();
+    }
     e.target.reset();
     setSource("local");
     file.onchange();

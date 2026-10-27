@@ -33,6 +33,7 @@ def dub_job(context, job_id: str):
     validate_doubao_key = context.validate_doubao_key
     write_wav = context.write_wav
     try:
+        context.check_pause(job_id)
         job = get_job(job_id)
         engine = job.get("dubbing_engine") or "azure"
         if engine not in ("azure", "doubao"):
@@ -76,8 +77,9 @@ def dub_job(context, job_id: str):
         cache_dir = DATA / "dubbing" / job_id
         source_track, _, timings = make_voice_track(
             segments, config, keys, cache_dir, duration,
-            progress=lambda count: update_job(job_id, dubbing_progress=count),
+            progress=lambda count: (context.check_pause(job_id), update_job(job_id, dubbing_progress=count)),
             baseline_info=baseline, synthesize_fn=synthesize_fn)
+        context.check_pause(job_id)
         pieces, cues, retiming, issues, output_duration = plan_elastic_timeline(
             segments, timings, duration, max_adjust=float(config["max_video_adjust"]))
         track = (source_track if issues else assemble_elastic_voice_track(
@@ -114,18 +116,23 @@ def dub_job(context, job_id: str):
         (DATA / f"{job_id}-dubbed-bilingual.srt").write_text(make_bilingual_srt(cues), encoding="utf-8-sig")
         burn_path = DATA / f"{job_id}-dubbed-{'bilingual' if subtitle_settings['mode'] == 'bilingual' else 'zh'}.srt"
         update_job(job_id, stage="render")
+        context.check_pause(job_id)
         instrumental = run / "separated" / "instrumental.flac" if job["separate_vocals"] else None
-        video_encoder = render_video(run / "source.mp4", instrumental,
-                     voice_path, DATA / f"{job_id}-dubbed.mp4", output_duration,
-                     float(config["background_volume"]),
-                     pieces if retiming else None,
-                     watermark=watermark_settings,
-                     subtitles=({**subtitle_settings, "enabled": False} if not cues else subtitle_settings),
-                     subtitle_path=burn_path, log_path=DATA / f"{job_id}.log")
+        with context.heavy_media_stage(job_id, "成片视频编码"):
+            video_encoder = render_video(run / "source.mp4", instrumental,
+                         voice_path, DATA / f"{job_id}-dubbed.mp4", output_duration,
+                         float(config["background_volume"]),
+                         pieces if retiming else None,
+                         watermark=watermark_settings,
+                         subtitles=({**subtitle_settings, "enabled": False} if not cues else subtitle_settings),
+                         subtitle_path=burn_path, log_path=DATA / f"{job_id}.log")
         if isinstance(video_encoder, str):
             report["video_encoder"] = video_encoder
             report_path.write_text(json.dumps(report, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        context.check_pause(job_id)
         update_job(job_id, stage="done", dubbing_status="done", dubbing_error="")
+    except context.PauseRequested:
+        context.mark_paused(job_id)
     except Exception as exc:
         update_job(job_id, dubbing_status="failed", dubbing_error=str(exc))
 

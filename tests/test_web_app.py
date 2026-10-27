@@ -14,6 +14,51 @@ from vidlingua import web_app
 
 
 class JobCreationTests(unittest.TestCase):
+    def test_pause_and_resume_reuse_translation_stage(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            job_id = "pause-test"
+            (root / f"{job_id}-translation-input.json").write_text("{}", encoding="utf-8")
+            with patch.object(web_app, "DATA", root), patch.object(web_app, "DB", root / "jobs.sqlite3"), \
+                 patch.object(web_app.executor, "submit") as submit:
+                web_app.initialize()
+                with web_app.connect() as conn:
+                    conn.execute("""INSERT INTO jobs
+                        (id,title,subject,glossary,filename,upload_path,run_path,status,stage,error,created_at,updated_at,
+                         translation_status,dubbing_status)
+                        VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                        (job_id, "Pause", "", "", "source.mp4", "", None, "prepared", "translate", "", "", "",
+                         "running", "not_started"))
+                self.assertEqual(web_app.pause_job(job_id)["pause_requested"], 1)
+                with self.assertRaises(web_app.PauseRequested):
+                    web_app.check_pause(job_id)
+                web_app.mark_paused(job_id)
+                self.assertEqual(web_app.get_job(job_id)["translation_status"], "paused")
+                result = web_app.resume_job(job_id)
+                self.assertEqual(result["status"], "prepared")
+                self.assertEqual(result["translation_status"], "queued")
+                self.assertEqual(result["pause_requested"], 0)
+                submit.assert_called_once_with(web_app.translate_then_dub, job_id)
+
+    def test_queued_job_pauses_before_media_work_and_resumes(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            with patch.object(web_app, "DATA", root), patch.object(web_app, "DB", root / "jobs.sqlite3"), \
+                 patch.object(web_app, "import_media") as importer, \
+                 patch.object(web_app.executor, "submit") as submit:
+                web_app.initialize()
+                with web_app.connect() as conn:
+                    conn.execute("""INSERT INTO jobs
+                        (id,title,subject,glossary,filename,upload_path,run_path,status,stage,error,created_at,updated_at)
+                        VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
+                        ("queued-test", "Queued", "", "", "source.mp4", "", None, "queued", "import", "", "", ""))
+                web_app.pause_job("queued-test")
+                web_app.process("queued-test")
+                importer.assert_not_called()
+                self.assertEqual(web_app.get_job("queued-test")["status"], "paused")
+                web_app.resume_job("queued-test")
+                submit.assert_called_once_with(web_app.process, "queued-test", True, True)
+
     def test_rerun_resets_segments_and_outputs_but_keeps_source(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -271,6 +316,7 @@ class JobCreationTests(unittest.TestCase):
     def test_automatic_finish_prepares_translates_and_dubs(self):
         with patch.object(web_app, "get_job", side_effect=[
                 {"status": "ready"}, {"translation_status": "done"}]), \
+             patch.object(web_app, "check_pause"), \
              patch.object(web_app, "prepare") as prepare, \
              patch.object(web_app, "translate_job") as translate, \
              patch.object(web_app, "dub_job") as dub:
@@ -292,12 +338,18 @@ class JobCreationTests(unittest.TestCase):
                 self.assertEqual(job["translation_status"], "not_started")
                 self.assertEqual(job["separate_vocals"], 1)
                 self.assertEqual(job["dubbing_engine"], "doubao")
+                self.assertFalse(job["publish_to_bilibili"])
                 self.assertEqual(web_app.download_filename({"title": "课程: 第一集"}, ".mp4"), "课程 第一集.mp4")
                 self.assertEqual(Path(job["upload_path"]).read_bytes(), b"video data")
                 no_split = web_app.create_job(
                     UploadFile(filename="course.mp4", file=io.BytesIO(b"another video")),
                     "不分离", False)
                 self.assertEqual(no_split["separate_vocals"], 0)
+                publish = web_app.create_job(
+                    UploadFile(filename="lesson.mp4", file=io.BytesIO(b"video")),
+                    "源标题", True, "doubao", True)
+                self.assertTrue(publish["publish_to_bilibili"])
+                self.assertEqual(publish["title"], "源标题")
 
     def test_create_youtube_job_waits_to_download_and_process(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -313,9 +365,42 @@ class JobCreationTests(unittest.TestCase):
                 self.assertEqual(job["separate_vocals"], 0)
                 self.assertEqual(job["dubbing_engine"], "doubao")
                 doubao = web_app.create_youtube_job(web_app.YouTubeJobCreate(
-                    url="https://www.youtube.com/watch?v=abcdefghijk", dubbing_engine="doubao"))
+                    url="https://www.youtube.com/watch?v=abcdefghijl", dubbing_engine="doubao"))
                 self.assertEqual(doubao["dubbing_engine"], "doubao")
+                self.assertEqual(doubao["separate_vocals"], 1)
                 self.assertFalse(Path(job["upload_path"]).exists())
+
+    def test_duplicate_youtube_address_returns_existing_job(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            with patch.object(web_app, "DB", root / "jobs.sqlite3"), \
+                 patch.object(web_app, "UPLOADS", root / "uploads"):
+                web_app.initialize()
+                original = web_app.create_youtube_job(web_app.YouTubeJobCreate(
+                    url="https://youtu.be/abcdefghijk?t=4", title="原任务"))
+                duplicate = web_app.create_youtube_job(web_app.YouTubeJobCreate(
+                    url="https://www.youtube.com/watch?v=abcdefghijk&t=10", title="重复任务",
+                    separate_vocals=False))
+                self.assertFalse(original["already_exists"])
+                self.assertTrue(duplicate["already_exists"])
+                self.assertEqual(duplicate["id"], original["id"])
+                self.assertEqual(duplicate["title"], "原任务")
+                self.assertEqual(duplicate["separate_vocals"], 1)
+                self.assertEqual(len(web_app.list_jobs()), 1)
+
+    def test_youtube_cover_path_appears_after_download(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            with patch.object(web_app, "DB", root / "jobs.sqlite3"), \
+                 patch.object(web_app, "UPLOADS", root / "uploads"):
+                web_app.initialize()
+                job = web_app.create_youtube_job(web_app.YouTubeJobCreate(
+                    url="https://www.youtube.com/watch?v=abcdefghijk"))
+                self.assertIsNone(web_app.job_detail(job["id"])["cover_path"])
+                cover = Path(job["upload_path"]).with_name("cover.jpg")
+                cover.parent.mkdir(parents=True)
+                cover.write_bytes(b"jpeg")
+                self.assertEqual(web_app.job_detail(job["id"])["cover_path"], str(cover.resolve()))
 
     def test_youtube_process_downloads_before_import(self):
         with tempfile.TemporaryDirectory() as directory:

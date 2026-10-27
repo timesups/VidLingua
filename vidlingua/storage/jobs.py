@@ -37,6 +37,9 @@ def initialize(open_connection):
             raw_text TEXT NOT NULL, edited_text TEXT NOT NULL, words TEXT NOT NULL,
             flags TEXT NOT NULL, reviewed INTEGER NOT NULL, needs_realign INTEGER NOT NULL,
             PRIMARY KEY(job_id,id))""")
+        conn.execute("""CREATE TABLE IF NOT EXISTS batches (
+            id TEXT PRIMARY KEY, title TEXT NOT NULL, source_dir TEXT NOT NULL,
+            created_at TEXT NOT NULL)""")
         columns = {row["name"] for row in conn.execute("PRAGMA table_info(jobs)")}
         for name, definition in {
             "translation_status": "TEXT NOT NULL DEFAULT 'not_started'",
@@ -49,10 +52,20 @@ def initialize(open_connection):
             "dubbing_error": "TEXT NOT NULL DEFAULT ''",
             "separate_vocals": "INTEGER NOT NULL DEFAULT 1",
             "source_url": "TEXT NOT NULL DEFAULT ''",
+            "publish_to_bilibili": "INTEGER NOT NULL DEFAULT 0",
             "dubbing_engine": "TEXT NOT NULL DEFAULT 'azure'",
+            "batch_id": "TEXT",
+            "batch_source_path": "TEXT",
+            "pause_requested": "INTEGER NOT NULL DEFAULT 0",
         }.items():
             if name not in columns:
                 conn.execute(f"ALTER TABLE jobs ADD COLUMN {name} {definition}")
+        conn.execute("""UPDATE jobs SET status='paused',
+                     translation_status=CASE WHEN translation_status IN ('queued','correcting','glossary','running')
+                         THEN 'paused' ELSE translation_status END,
+                     dubbing_status=CASE WHEN dubbing_status IN ('queued','running')
+                         THEN 'paused' ELSE dubbing_status END
+                     WHERE pause_requested=1""")
         conn.execute("UPDATE jobs SET status='interrupted', error='服务重启中断了处理；可点击重试' WHERE status IN ('queued','running')")
         conn.execute("UPDATE jobs SET translation_status='interrupted', translation_error='服务重启中断了翻译；可重试' WHERE translation_status IN ('queued','correcting','glossary','running')")
         conn.execute("UPDATE jobs SET dubbing_status='interrupted', dubbing_error='服务重启中断了配音；可重试' WHERE dubbing_status IN ('queued','running')")

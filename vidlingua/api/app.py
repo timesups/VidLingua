@@ -24,8 +24,11 @@ from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.responses import FileResponse, Response
 from fastapi.staticfiles import StaticFiles
 from pydantic import BaseModel
+from typing import Literal
 
 from ..pipeline.import_media import import_media
+from ..pipeline.external_subtitles import matching_subtitle, import_subtitle_transcript
+from ..pipeline.batch import VIDEO_SUFFIXES, prepare_video as prepare_batch_video, publish_video as publish_batch_video, scan_directory
 from ..pipeline.youtube import (canonical_youtube_url, download_youtube,
                                 load_config as load_youtube_config,
                                 save_config as save_youtube_config,
@@ -83,8 +86,65 @@ BILIBILI_COOKIES = DATA / "bilibili_cookies.json"
 WEB = ROOT / "web"
 DATA.mkdir(exist_ok=True)
 UPLOADS.mkdir(exist_ok=True)
-executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="vidlingua-gpu")
+executor = ThreadPoolExecutor(max_workers=4, thread_name_prefix="vidlingua-job")
+heavy_media_lock = threading.Lock()
+folder_picker_lock = threading.Lock()
 db_lock = threading.RLock()
+
+
+class PauseRequested(Exception):
+    """A worker reached a safe pause point."""
+
+
+def check_pause(job_id: str) -> None:
+    with connect() as conn:
+        row = conn.execute("SELECT pause_requested FROM jobs WHERE id=?", (job_id,)).fetchone()
+    if row is None or row["pause_requested"]:
+        raise PauseRequested()
+
+
+def mark_paused(job_id: str) -> None:
+    job = get_job(job_id)
+    fields = {"status": "paused"}
+    if job["translation_status"] in ("queued", "correcting", "glossary", "running"):
+        fields["translation_status"] = "paused"
+    if job["dubbing_status"] in ("queued", "running"):
+        fields["dubbing_status"] = "paused"
+    update_job(job_id, **fields)
+
+
+@contextmanager
+def pause_aware_pool(max_workers: int):
+    pool = ThreadPoolExecutor(max_workers=max_workers)
+    try:
+        yield pool
+    except PauseRequested:
+        pool.shutdown(wait=False, cancel_futures=True)
+        raise
+    except BaseException:
+        pool.shutdown(wait=True, cancel_futures=True)
+        raise
+    else:
+        pool.shutdown(wait=True)
+
+
+@contextmanager
+def heavy_media_stage(job_id: str, label: str, *, pause_sensitive: bool = True):
+    """Run only one local high-load media stage at a time across jobs."""
+    if not heavy_media_lock.acquire(blocking=False):
+        with (DATA / f"{job_id}.log").open("a", encoding="utf-8") as log:
+            log.write(f"等待重负载资源：{label}\n")
+        while not heavy_media_lock.acquire(timeout=0.5):
+            if pause_sensitive:
+                check_pause(job_id)
+    try:
+        if pause_sensitive:
+            check_pause(job_id)
+        with (DATA / f"{job_id}.log").open("a", encoding="utf-8") as log:
+            log.write(f"开始重负载阶段：{label}\n")
+        yield
+    finally:
+        heavy_media_lock.release()
 @asynccontextmanager
 async def app_lifespan(application: FastAPI):
     initialize()
@@ -121,12 +181,23 @@ def download_filename(job: dict, suffix: str) -> str:
 
 
 def update_job(job_id: str, **fields):
-    return job_store.update_job(connect, db_lock, DATA, job_id, **fields)
+    with db_lock:
+        if fields.get("pause_requested") != 0 and (fields.get("status") in ("ready", "prepared") or
+                fields.get("translation_status") == "done" or
+                fields.get("dubbing_status") in ("done", "needs_review")):
+            check_pause(job_id)
+        return job_store.update_job(connect, db_lock, DATA, job_id, **fields)
 
 
 def stage_progress(job: dict, job_id: str) -> dict:
     """Current-stage progress; null percent means the underlying tool has no reliable counter."""
+    if job["status"] == "paused":
+        return {"percent": None, "label": "已暂停；可点击继续任务"}
+    if job.get("pause_requested"):
+        return {"percent": None, "label": "正在等待当前步骤结束后暂停"}
     if job["dubbing_status"] in ("running", "done", "needs_review", "failed"):
+        if job["stage"] == "publish" and job["dubbing_status"] == "running":
+            return {"percent": None, "label": "正在将成片写入 Translate 文件夹"}
         if job["stage"] == "render" and job["dubbing_status"] == "running":
             return {"percent": None, "label": "正在合成视频；视频编码暂不提供准确百分比"}
         done, total = job["dubbing_progress"], job["dubbing_total"]
@@ -210,65 +281,100 @@ def translate_job(job_id: str):
 
 def translate_then_dub(job_id: str):
     try:
+        check_pause(job_id)
         job = get_job(job_id)
         if job["status"] != "prepared" or not (DATA / f"{job_id}-translation-input.json").is_file():
             prepare(job_id)
         translate_job(job_id)
+        check_pause(job_id)
         if get_job(job_id)["translation_status"] == "done":
             dub_job(job_id)
+    except PauseRequested:
+        mark_paused(job_id)
     except Exception as exc:
         update_job(job_id, translation_status="failed", translation_error=str(exc))
 
 
-def process(job_id: str, reuse_download: bool = False):
+def process(job_id: str, reuse_download: bool = False, resume: bool = False):
     try:
+        check_pause(job_id)
         job = get_job(job_id)
         log = DATA / f"{job_id}.log"
-        log.write_text("", encoding="utf-8")
+        if not resume:
+            log.write_text("", encoding="utf-8")
         if job.get("source_url") and (not reuse_download or not Path(job["upload_path"]).is_file()):
             update_job(job_id, status="running", stage="download", error="")
             info = download_youtube(job["source_url"], Path(job["upload_path"]), log,
                                     YOUTUBE_CONFIG, YOUTUBE_COOKIES)
             if job["title"] == f"YouTube {info['id']}" and info.get("title"):
                 update_job(job_id, title=info["title"][:160])
+        check_pause(job_id)
         update_job(job_id, status="running", stage="import", error="")
-        run = import_media(Path(job["upload_path"]), ROOT / "runs")
+        with heavy_media_stage(job_id, "视频准备与导入"):
+            if job.get("batch_source_path"):
+                prepare_batch_video(Path(job["batch_source_path"]), Path(job["upload_path"]), log)
+            run = import_media(Path(job["upload_path"]), ROOT / "runs")
+        check_pause(job_id)
         separate = bool(job["separate_vocals"])
         update_job(job_id, run_path=str(run))
         if separate:
             update_job(job_id, stage="separate")
-            with log.open("a", encoding="utf-8") as output:
-                result = subprocess.run([sys.executable, "-m", "vidlingua.pipeline.separate_audio", str(run)],
-                                        cwd=ROOT, stdout=output, stderr=subprocess.STDOUT, check=False)
+            with heavy_media_stage(job_id, "人声分离"):
+                with log.open("a", encoding="utf-8") as output:
+                    result = subprocess.run([sys.executable, "-m", "vidlingua.pipeline.separate_audio", str(run)],
+                                            cwd=ROOT, stdout=output, stderr=subprocess.STDOUT, check=False)
             if result.returncode:
                 raise RuntimeError(f"人声分离失败，退出码 {result.returncode}；请查看处理日志")
+        check_pause(job_id)
         update_job(job_id, stage="transcribe")
         audio_source = "vocals" if separate else "original"
-        transcript = run / f"transcript_{audio_source}" / ("asr_vocals.json" if separate else "asr_audio.json")
+        asr_transcript = run / f"transcript_{audio_source}" / ("asr_vocals.json" if separate else "asr_audio.json")
+        transcript = asr_transcript
+        subtitle_imported = False
+        if job.get("batch_source_path"):
+            subtitle_source = matching_subtitle(Path(job["batch_source_path"]))
+            if subtitle_source:
+                try:
+                    transcript = DATA / f"{job_id}-external-transcript.json"
+                    reused = import_subtitle_transcript(subtitle_source, transcript)
+                    subtitle_imported = True
+                    with log.open("a", encoding="utf-8") as output:
+                        output.write(f"批处理：使用同名字幕 {subtitle_source.name}，{'复用导入结果' if reused else '已导入'}；跳过 WhisperX\n")
+                except (OSError, UnicodeError, ValueError) as exc:
+                    transcript = asr_transcript
+                    with log.open("a", encoding="utf-8") as output:
+                        output.write(f"批处理：同名字幕不可用（{exc}），回退英文识别\n")
         with log.open("a", encoding="utf-8") as output:
-            output.write(f"ASR 输入：{audio_source}，音频文件：{'asr_vocals.wav' if separate else 'asr_audio.wav'}，"
-                         f"现有转写：{'复用并复查' if transcript.is_file() else '重新识别'}\n")
-        if not transcript.is_file():
-            with log.open("a", encoding="utf-8") as output:
-                result = subprocess.run([sys.executable, "-m", "vidlingua.pipeline.transcribe",
-                                         str(run), "--audio-source", audio_source],
-                                        cwd=ROOT, stdout=output, stderr=subprocess.STDOUT,
-                                        check=False)
-            if result.returncode or not transcript.is_file():
-                raise RuntimeError(f"WhisperX 失败，退出码 {result.returncode}；请查看处理日志")
-        if transcript.is_file():
-            from vidlingua.pipeline.transcribe import recover_transcript_gaps
-            source_audio = run / ("asr_vocals.wav" if separate else "asr_audio.wav")
-            def record_asr(message: str) -> None:
-                with log.open("a", encoding="utf-8") as output:
-                    output.write(message + "\n")
-            recover_transcript_gaps(source_audio, transcript, logger=record_asr)
+            if not subtitle_imported:
+                output.write(f"ASR 输入：{audio_source}，音频文件：{'asr_vocals.wav' if separate else 'asr_audio.wav'}，"
+                             f"现有转写：{'复用并复查' if transcript.is_file() else '重新识别'}\n")
+        if not subtitle_imported:
+            with heavy_media_stage(job_id, "英文识别与漏句复查"):
+                if not transcript.is_file():
+                    with log.open("a", encoding="utf-8") as output:
+                        result = subprocess.run([sys.executable, "-m", "vidlingua.pipeline.transcribe",
+                                                 str(run), "--audio-source", audio_source],
+                                                cwd=ROOT, stdout=output, stderr=subprocess.STDOUT,
+                                                check=False)
+                    if result.returncode or not transcript.is_file():
+                        raise RuntimeError(f"WhisperX 失败，退出码 {result.returncode}；请查看处理日志")
+                if transcript.is_file():
+                    from vidlingua.pipeline.transcribe import recover_transcript_gaps
+                    source_audio = run / ("asr_vocals.wav" if separate else "asr_audio.wav")
+                    def record_asr(message: str) -> None:
+                        with log.open("a", encoding="utf-8") as output:
+                            output.write(message + "\n")
+                    recover_transcript_gaps(source_audio, transcript, logger=record_asr)
+        check_pause(job_id)
         update_job(job_id, stage="organize")
         duration = json.loads((run / "manifest.json").read_text(encoding="utf-8"))["media"]["duration_seconds"]
         if not segment_rows(job_id):
             save_segments(job_id, make_segments(transcript, duration))
+        check_pause(job_id)
         update_job(job_id, stage="review", status="ready")
         translate_then_dub(job_id)
+    except PauseRequested:
+        mark_paused(job_id)
     except Exception as exc:
         update_job(job_id, status="failed", error=str(exc))
 
@@ -282,9 +388,158 @@ def index():
 def list_jobs():
     with connect() as conn:
         rows = conn.execute("""SELECT id,title,filename,status,stage,error,created_at,updated_at,
-                               translation_status,dubbing_status,dubbing_engine,separate_vocals,source_url
-                               FROM jobs ORDER BY created_at DESC""").fetchall()
-    return [dict(row) for row in rows]
+                               translation_status,dubbing_status,dubbing_engine,separate_vocals,source_url,batch_id,pause_requested
+                               FROM jobs WHERE batch_id IS NULL ORDER BY created_at DESC""").fetchall()
+        batch_ids = [row["id"] for row in conn.execute("SELECT id FROM batches").fetchall()]
+    items = [dict(row) for row in rows]
+    items.extend(batch_summary(batch_id, include_children=False) for batch_id in batch_ids)
+    return sorted(items, key=lambda item: item["created_at"], reverse=True)
+
+
+def batch_summary(batch_id: str, include_children: bool = True) -> dict:
+    with connect() as conn:
+        batch = conn.execute("SELECT * FROM batches WHERE id=?", (batch_id,)).fetchone()
+        if batch is None:
+            raise HTTPException(404, "批处理任务不存在")
+        children = [dict(row) for row in conn.execute(
+            """SELECT id,title,filename,status,stage,error,created_at,updated_at,
+                      translation_status,translation_error,dubbing_status,dubbing_error,
+                      dubbing_engine,separate_vocals,batch_source_path,pause_requested
+               FROM jobs WHERE batch_id=? ORDER BY filename COLLATE NOCASE,id""", (batch_id,)
+        ).fetchall()]
+    completed = sum(child["dubbing_status"] == "done" for child in children)
+    failed = sum(child["status"] in ("failed", "interrupted") or
+                 child["translation_status"] in ("failed", "interrupted") or
+                 child["dubbing_status"] in ("failed", "interrupted") for child in children)
+    review = sum(child["dubbing_status"] == "needs_review" for child in children)
+    status = ("done" if children and completed == len(children) else
+              "running" if any(child["status"] in ("queued", "running") or
+                               child["translation_status"] in ("queued", "correcting", "glossary", "running") or
+                               child["dubbing_status"] in ("queued", "running") for child in children) else
+              "paused" if any(child["status"] == "paused" for child in children) else
+              "failed" if failed else "review" if review else "created")
+    output_dir = str(Path(batch["source_dir"]) / "Translate")
+    summary = {**dict(batch), "kind": "batch", "filename": batch["source_dir"],
+               "supports_actions": True,
+               "status": status, "translation_status": "", "dubbing_status": "",
+               "source_url": "", "dubbing_engine": "", "updated_at": batch["created_at"],
+               "count": len(children), "completed": completed, "failed": failed,
+               "review": review, "output_dir": output_dir}
+    if include_children:
+        summary["children"] = children
+    return summary
+
+
+class BatchCreate(BaseModel):
+    path: str
+    separate_vocals: bool = True
+    dubbing_engine: str = "doubao"
+
+
+def pick_folder_dialog() -> str | None:
+    try:
+        result = subprocess.run(
+            [sys.executable, "-m", "vidlingua.api.folder_picker"],
+            cwd=ROOT, capture_output=True, text=True, encoding="utf-8", errors="replace",
+            timeout=300, check=False,
+            creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise HTTPException(504, "选择文件夹超时，请重试或手动输入路径") from exc
+    if result.returncode:
+        raise HTTPException(503, f"无法打开文件夹选择窗口：{result.stderr.strip()[-500:]}")
+    try:
+        selected = json.loads(result.stdout.strip())
+    except json.JSONDecodeError as exc:
+        raise HTTPException(503, "文件夹选择窗口未返回有效路径") from exc
+    if selected and not Path(selected).is_dir():
+        raise HTTPException(400, "所选文件夹已不存在")
+    return selected
+
+
+@app.post("/api/batches/select-folder")
+def select_batch_folder():
+    if not folder_picker_lock.acquire(blocking=False):
+        raise HTTPException(409, "已有文件夹选择窗口，请先完成当前选择")
+    try:
+        return {"path": pick_folder_dialog()}
+    finally:
+        folder_picker_lock.release()
+
+
+@app.post("/api/batches")
+def create_batch(payload: BatchCreate):
+    if not payload.path.strip():
+        raise HTTPException(400, "请输入文件夹路径")
+    try:
+        videos = scan_directory(Path(payload.path.strip()))
+    except (OSError, ValueError) as exc:
+        raise HTTPException(400, str(exc)) from exc
+    engine = _valid_engine(payload.dubbing_engine)
+    directory = videos[0].parent
+    batch_id = uuid.uuid4().hex[:12]
+    timestamp = now()
+    jobs = []
+    with db_lock, connect() as conn:
+        conn.execute("INSERT INTO batches (id,title,source_dir,created_at) VALUES (?,?,?,?)",
+                     (batch_id, directory.name, str(directory), timestamp))
+        for source in videos:
+            job_id = uuid.uuid4().hex[:12]
+            upload = UPLOADS / job_id / f"{source.stem}.mp4"
+            conn.execute("""INSERT INTO jobs
+                (id,title,subject,glossary,filename,upload_path,run_path,status,stage,error,
+                 created_at,updated_at,separate_vocals,dubbing_engine,batch_id,batch_source_path)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                (job_id, source.stem, "", "", source.name, str(upload), None, "queued", "import", "",
+                 timestamp, timestamp, int(payload.separate_vocals), engine, batch_id, str(source)))
+            jobs.append(job_id)
+    for job_id in jobs:
+        executor.submit(process, job_id)
+    return batch_summary(batch_id)
+
+
+@app.get("/api/batches/{batch_id}")
+def get_batch(batch_id: str):
+    return batch_summary(batch_id)
+
+
+@app.post("/api/batches/{batch_id}/pause")
+def pause_batch(batch_id: str):
+    batch = batch_summary(batch_id)
+    for child in batch["children"]:
+        if (child["status"] in ("queued", "running") or
+                child["translation_status"] in ("queued", "correcting", "glossary", "running") or
+                child["dubbing_status"] in ("queued", "running")) and not child["pause_requested"]:
+            pause_job(child["id"])
+    return batch_summary(batch_id)
+
+
+@app.post("/api/batches/{batch_id}/resume")
+def resume_batch(batch_id: str):
+    batch = batch_summary(batch_id)
+    for child in batch["children"]:
+        if child["status"] == "paused":
+            resume_job(child["id"])
+    return batch_summary(batch_id)
+
+
+@app.post("/api/batches/{batch_id}/rerun")
+def rerun_batch(batch_id: str):
+    batch = batch_summary(batch_id)
+    _rerun_jobs([child["id"] for child in batch["children"]])
+    return batch_summary(batch_id)
+
+
+@app.delete("/api/batches/{batch_id}")
+def delete_batch(batch_id: str):
+    with db_lock:
+        batch = batch_summary(batch_id)
+        ids = [child["id"] for child in batch["children"]]
+        if ids:
+            _delete_jobs(ids)
+        with connect() as conn:
+            conn.execute("DELETE FROM batches WHERE id=?", (batch_id,))
+    return {"deleted": batch_id}
 
 
 class JobSelection(BaseModel):
@@ -292,8 +547,8 @@ class JobSelection(BaseModel):
 
 
 def _selected_jobs(ids: list[str]) -> list[dict]:
-    if not ids or len(ids) > 100 or len(set(ids)) != len(ids):
-        raise HTTPException(400, "请选择 1–100 个不同的任务")
+    if not ids or len(set(ids)) != len(ids):
+        raise HTTPException(400, "请选择不同的任务")
     jobs = [get_job(job_id) for job_id in ids]
     for job in jobs:
         if job["id"] in _manual_edit_running:
@@ -325,7 +580,8 @@ def _rerun_jobs(ids: list[str]) -> list[dict]:
     with db_lock:
         jobs = _selected_jobs(ids)
         for job in jobs:
-            if not job.get("source_url") and not Path(job["upload_path"]).is_file():
+            if (not job.get("source_url") and not Path(job["upload_path"]).is_file()
+                    and not (job.get("batch_source_path") and Path(job["batch_source_path"]).is_file())):
                 raise HTTPException(409, f"任务 {job['title']} 的原视频不存在，无法重跑")
         for job in jobs:
             job_id = job["id"]
@@ -335,7 +591,7 @@ def _rerun_jobs(ids: list[str]) -> list[dict]:
                 conn.execute("DELETE FROM segments WHERE job_id=?", (job_id,))
                 conn.execute("""UPDATE jobs SET status='queued',stage='import',error='',
                     translation_status='not_started',translation_progress=0,translation_total=0,translation_error='',
-                    dubbing_status='not_started',dubbing_progress=0,dubbing_total=0,dubbing_error='',updated_at=?
+                    dubbing_status='not_started',dubbing_progress=0,dubbing_total=0,dubbing_error='',pause_requested=0,updated_at=?
                     WHERE id=?""", (now(), job_id))
         for job in jobs:
             executor.submit(process, job["id"], True)
@@ -357,19 +613,43 @@ def _delete_jobs(ids: list[str]) -> list[str]:
     return ids
 
 
+def _expand_bulk_selection(ids: list[str]) -> tuple[list[str], list[str]]:
+    if not ids or len(ids) > 100 or len(set(ids)) != len(ids):
+        raise HTTPException(400, "请选择 1–100 个不同的任务")
+    with connect() as conn:
+        batches = {row["id"] for row in conn.execute(
+            f"SELECT id FROM batches WHERE id IN ({','.join('?' for _ in ids)})", ids)}
+    expanded = []
+    for item_id in ids:
+        if item_id in batches:
+            expanded.extend(child["id"] for child in batch_summary(item_id)["children"])
+        else:
+            get_job(item_id)
+            expanded.append(item_id)
+    return list(dict.fromkeys(expanded)), [item_id for item_id in ids if item_id in batches]
+
+
 @app.post("/api/jobs/bulk/rerun")
 def bulk_rerun_jobs(selection: JobSelection):
-    return {"jobs": _rerun_jobs(selection.ids)}
+    ids, _ = _expand_bulk_selection(selection.ids)
+    return {"jobs": _rerun_jobs(ids) if ids else []}
 
 
 @app.delete("/api/jobs/bulk")
 def bulk_delete_jobs(selection: JobSelection):
-    return {"deleted": _delete_jobs(selection.ids)}
+    with db_lock:
+        ids, batches = _expand_bulk_selection(selection.ids)
+        if ids:
+            _delete_jobs(ids)
+        with connect() as conn:
+            conn.executemany("DELETE FROM batches WHERE id=?", [(batch_id,) for batch_id in batches])
+    return {"deleted": selection.ids}
 
 
 @app.post("/api/jobs")
 def create_job(file: UploadFile = File(...), title: str = Form(""),
-               separate_vocals: bool = Form(False), dubbing_engine: str = Form("doubao")):
+               separate_vocals: bool = Form(True), dubbing_engine: str = Form("doubao"),
+               publish_to_bilibili: bool = Form(False)):
     filename = Path(file.filename or "video.mp4").name
     if Path(filename).suffix.lower() != ".mp4":
         raise HTTPException(400, "首版仅支持 MP4 视频")
@@ -386,19 +666,78 @@ def create_job(file: UploadFile = File(...), title: str = Form(""),
     timestamp = now()
     with db_lock, connect() as conn:
         conn.execute("""INSERT INTO jobs
-            (id,title,subject,glossary,filename,upload_path,run_path,status,stage,error,created_at,updated_at,separate_vocals,dubbing_engine)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (id,title,subject,glossary,filename,upload_path,run_path,status,stage,error,created_at,updated_at,separate_vocals,dubbing_engine,publish_to_bilibili)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                      (job_id, title.strip() or Path(filename).stem, "", "",
                       filename, str(upload), None, "created", "upload", "", timestamp, timestamp,
-                      int(separate_vocals), engine))
+                      int(separate_vocals), engine,
+                      int(publish_to_bilibili) if isinstance(publish_to_bilibili, bool) else 0))
     return get_job(job_id)
 
 
 class YouTubeJobCreate(BaseModel):
     url: str
     title: str = ""
-    separate_vocals: bool = False
+    separate_vocals: bool = True
     dubbing_engine: str = "doubao"
+    publish_to_bilibili: bool = True
+
+
+class ApiJobCreate(BaseModel):
+    source: Literal["local", "youtube", "batch"]
+    path: str = ""
+    url: str = ""
+    title: str = ""
+    separate_vocals: bool = True
+    dubbing_engine: str = "doubao"
+    publish_to_bilibili: bool | None = None
+
+
+@app.post("/api/jobs/create", status_code=202)
+def create_job_by_api(payload: ApiJobCreate):
+    """Create and queue a job from a server-side path, YouTube URL, or folder."""
+    if payload.source == "batch":
+        batch = create_batch(BatchCreate(path=payload.path, separate_vocals=payload.separate_vocals,
+                                         dubbing_engine=payload.dubbing_engine))
+        return {**batch, "detail_url": f"/#batch/{batch['id']}"}
+    if payload.source == "youtube":
+        if not payload.url.strip():
+            raise HTTPException(400, "请输入 YouTube 地址")
+        job = create_youtube_job(YouTubeJobCreate(
+            url=payload.url, title=payload.title, separate_vocals=payload.separate_vocals,
+            dubbing_engine=payload.dubbing_engine,
+            publish_to_bilibili=(payload.publish_to_bilibili
+                                 if payload.publish_to_bilibili is not None else True)))
+        if not job["already_exists"]:
+            job = {**run_job(job["id"]), "already_exists": False}
+        return {**job, "kind": "job", "detail_url": f"/#job/{job['id']}"}
+
+    if not payload.path.strip():
+        raise HTTPException(400, "请输入视频文件路径")
+    try:
+        source = Path(payload.path.strip()).expanduser().resolve(strict=True)
+        if not source.is_file():
+            raise ValueError("路径不是视频文件")
+        if source.suffix.lower() not in VIDEO_SUFFIXES:
+            raise ValueError("不支持的视频格式")
+        if source.stat().st_size == 0:
+            raise ValueError("视频文件为空")
+    except (OSError, ValueError) as exc:
+        raise HTTPException(400, str(exc)) from exc
+    engine = _valid_engine(payload.dubbing_engine)
+    job_id = uuid.uuid4().hex[:12]
+    upload = UPLOADS / job_id / f"{source.stem}.mp4"
+    timestamp = now()
+    with db_lock, connect() as conn:
+        conn.execute("""INSERT INTO jobs
+            (id,title,subject,glossary,filename,upload_path,run_path,status,stage,error,
+             created_at,updated_at,separate_vocals,dubbing_engine,batch_source_path,publish_to_bilibili)
+            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (job_id, payload.title.strip() or source.stem, "", "", source.name, str(upload),
+             None, "queued", "import", "", timestamp, timestamp, int(payload.separate_vocals),
+             engine, str(source), int(bool(payload.publish_to_bilibili))))
+    executor.submit(process, job_id)
+    return {**get_job(job_id), "kind": "job", "detail_url": f"/#job/{job_id}"}
 
 
 class YouTubeConfigEdit(BaseModel):
@@ -444,27 +783,74 @@ def create_youtube_job(payload: YouTubeJobCreate):
         canonical, video_id = canonical_youtube_url(payload.url)
     except ValueError as exc:
         raise HTTPException(400, str(exc)) from exc
-    job_id = uuid.uuid4().hex[:12]
-    filename = f"youtube-{video_id}.mp4"
-    upload = UPLOADS / job_id / filename
-    timestamp = now()
     with db_lock, connect() as conn:
-        conn.execute("""INSERT INTO jobs
-            (id,title,subject,glossary,filename,upload_path,run_path,status,stage,error,created_at,updated_at,separate_vocals,source_url,dubbing_engine)
-            VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
-                     (job_id, payload.title.strip() or f"YouTube {video_id}", "", "",
-                      filename, str(upload), None, "created", "download", "", timestamp, timestamp,
-                      int(payload.separate_vocals), canonical, _valid_engine(payload.dubbing_engine)))
-    return get_job(job_id)
+        conn.execute("BEGIN IMMEDIATE")
+        existing = conn.execute(
+            "SELECT id FROM jobs WHERE source_url=? ORDER BY created_at DESC LIMIT 1", (canonical,)
+        ).fetchone()
+        if existing:
+            job_id = existing["id"]
+        else:
+            job_id = uuid.uuid4().hex[:12]
+            filename = f"youtube-{video_id}.mp4"
+            upload = UPLOADS / job_id / filename
+            timestamp = now()
+            conn.execute("""INSERT INTO jobs
+                (id,title,subject,glossary,filename,upload_path,run_path,status,stage,error,created_at,updated_at,separate_vocals,source_url,dubbing_engine,publish_to_bilibili)
+                VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                         (job_id, payload.title.strip() or f"YouTube {video_id}", "", "",
+                          filename, str(upload), None, "created", "download", "", timestamp, timestamp,
+                          int(payload.separate_vocals), canonical, _valid_engine(payload.dubbing_engine),
+                          int(payload.publish_to_bilibili)))
+    job = get_job(job_id)
+    job["already_exists"] = existing is not None
+    return job
 
 
 @app.post("/api/jobs/{job_id}/run")
 def run_job(job_id: str):
     job = get_job(job_id)
-    if job["status"] in ("queued", "running"):
-        raise HTTPException(409, "任务正在处理")
+    if job["status"] in ("queued", "running", "paused") or job["pause_requested"]:
+        raise HTTPException(409, "任务正在处理或已暂停，请使用继续任务")
     update_job(job_id, status="queued", error="")
     executor.submit(process, job_id)
+    return get_job(job_id)
+
+
+@app.post("/api/jobs/{job_id}/pause")
+def pause_job(job_id: str):
+    with db_lock:
+        job = get_job(job_id)
+        if job["pause_requested"]:
+            return job
+        active = (job["status"] in ("queued", "running") or
+                  job["translation_status"] in ("queued", "correcting", "glossary", "running") or
+                  job["dubbing_status"] in ("queued", "running"))
+        if not active:
+            raise HTTPException(409, "任务当前没有正在运行的处理阶段")
+        update_job(job_id, pause_requested=1)
+    return get_job(job_id)
+
+
+@app.post("/api/jobs/{job_id}/resume")
+def resume_job(job_id: str):
+    with db_lock:
+        job = get_job(job_id)
+        if job["status"] != "paused":
+            raise HTTPException(409, "只有已暂停的任务可以继续")
+        if job["dubbing_status"] == "paused" and job["translation_status"] == "done":
+            target = dub_job
+            update_job(job_id, pause_requested=0, status="ready", dubbing_status="queued")
+        elif job["translation_status"] in ("paused", "done") and (DATA / f"{job_id}-translation-input.json").is_file():
+            target = translate_then_dub
+            update_job(job_id, pause_requested=0, status="prepared", translation_status="queued")
+        else:
+            target = process
+            update_job(job_id, pause_requested=0, status="queued")
+        if target is process:
+            executor.submit(target, job_id, True, True)
+        else:
+            executor.submit(target, job_id)
     return get_job(job_id)
 
 
@@ -488,6 +874,14 @@ def _asr_diagnostics_path(job: dict) -> Path:
 @app.get("/api/jobs/{job_id}")
 def job_detail(job_id: str):
     job = get_job(job_id)
+    if job.get("batch_id"):
+        with connect() as conn:
+            batch = conn.execute("SELECT source_dir FROM batches WHERE id=?", (job["batch_id"],)).fetchone()
+        job["batch_output_path"] = (str(Path(batch["source_dir"]) / "Translate" /
+                                        f"{Path(job['batch_source_path']).name}.translated.mp4")
+                                    if batch else None)
+    cover = Path(job["upload_path"]).with_name("cover.jpg") if job.get("source_url") else None
+    job["cover_path"] = str(cover.resolve()) if cover and cover.is_file() else None
     segments = segment_rows(job_id)
     job["segment_count"] = len(segments)
     job["review_count"] = sum(bool(s["flags"]) and not s["reviewed"] for s in segments)
@@ -714,6 +1108,8 @@ def test_deepseek():
 @app.post("/api/jobs/{job_id}/translate")
 def start_translation(job_id: str, force: bool = False):
     job = get_job(job_id)
+    if job["status"] == "paused" or job["pause_requested"]:
+        raise HTTPException(409, "任务已暂停，请先继续任务")
     if job["status"] not in ("ready", "prepared"):
         raise HTTPException(409, "请先完成英文转写")
     key = get_api_key()
@@ -855,12 +1251,44 @@ def _valid_engine(engine: str) -> str:
 
 
 def dub_job(job_id: str):
-    return dubbing_service.dub_job(sys.modules[__name__], job_id)
+    result = dubbing_service.dub_job(sys.modules[__name__], job_id)
+    job = get_job(job_id)
+    if (not job.get("batch_id") and job.get("publish_to_bilibili")
+            and job["dubbing_status"] == "done"):
+        try:
+            _auto_publish_bilibili(job_id)
+        except Exception as exc:
+            meta = _bilibili_view(job_id)
+            meta.update(status="error", message="自动投稿失败", error=str(exc) or "自动投稿失败")
+            bilibili_provider.save_job_meta(DATA / f"{job_id}-bilibili.json", meta)
+    if job.get("batch_id") and job["dubbing_status"] == "done":
+        try:
+            check_pause(job_id)
+            update_job(job_id, stage="publish", dubbing_status="running")
+            with connect() as conn:
+                batch = conn.execute("SELECT source_dir FROM batches WHERE id=?", (job["batch_id"],)).fetchone()
+            if batch is None:
+                raise RuntimeError("批处理父任务不存在")
+            target = (Path(batch["source_dir"]) / "Translate" /
+                      f"{Path(job['batch_source_path']).name}.translated.mp4")
+            with heavy_media_stage(job_id, "成片写入目标文件夹"):
+                publish_batch_video(DATA / f"{job_id}-dubbed.mp4", target)
+            check_pause(job_id)
+            with (DATA / f"{job_id}.log").open("a", encoding="utf-8") as log:
+                log.write(f"批处理：成片已输出到 {target}\n")
+            update_job(job_id, stage="done", dubbing_status="done")
+        except PauseRequested:
+            mark_paused(job_id)
+        except Exception as exc:
+            update_job(job_id, dubbing_status="failed", dubbing_error=f"成片输出失败：{exc}")
+    return result
 
 
 @app.post("/api/jobs/{job_id}/dub")
 def start_dubbing(job_id: str):
     job = get_job(job_id)
+    if job["status"] == "paused" or job["pause_requested"]:
+        raise HTTPException(409, "任务已暂停，请先继续任务")
     if job_id in _manual_edit_running:
         raise HTTPException(409, "剪辑导出正在进行，请完成后再重新配音")
     if job["translation_status"] != "done":
@@ -1007,7 +1435,8 @@ def _export_manual_edit(job_id: str, revision: str) -> None:
             state["status"] = "rendering"
             _write_manual_edit(job_id, state)
         _, _, output = _manual_edit_paths(job_id)
-        manual_edit.render_edit(source, output, state["ranges"], DATA / f"{job_id}.log")
+        with heavy_media_stage(job_id, "手动剪辑视频编码", pause_sensitive=False):
+            manual_edit.render_edit(source, output, state["ranges"], DATA / f"{job_id}.log")
         for kind in ("zh", "bilingual"):
             original = DATA / f"{job_id}-dubbed-{kind}.srt"
             edited = DATA / f"{job_id}-edited-{kind}.srt"
@@ -1259,7 +1688,7 @@ class BilibiliDraft(BaseModel):
     desc: str = ""
     tags: str = ""
     dynamic: str = ""
-    tid: int = 229
+    tid: int | None = None
 
 
 def _bilibili_view(job_id: str) -> dict:
@@ -1275,9 +1704,11 @@ def _save_bilibili_draft(job_id: str, body: BilibiliDraft, *, require_text: bool
     if require_text and (not title or not desc):
         raise HTTPException(400, "请先填写中文标题和简介")
     current.update({"title": title, "desc": desc,
-                    "tags": bilibili_provider.tag_text(body.tags) or settings["tags"],
+                    "tags": bilibili_provider.tag_text(body.tags),
                     "dynamic": str(current.get("dynamic") or "")[:100],
-                    "tid": int(settings["tid"])})
+                    "tid": body.tid if body.tid is not None else int(current.get("tid") or settings["tid"])})
+    if current["tid"] not in bilibili_provider.PARTITION_TIDS:
+        raise HTTPException(400, "请选择支持的投稿分区")
     bilibili_provider.save_job_meta(DATA / f"{job_id}-bilibili.json", current)
     return current
 
@@ -1355,6 +1786,18 @@ def generate_bilibili_meta(job_id: str):
     return saved
 
 
+def _auto_publish_bilibili(job_id: str) -> None:
+    existing = _bilibili_view(job_id)
+    if existing["status"] in ("uploading", "success"):
+        return
+    generated = generate_bilibili_meta(job_id)
+    if generated.get("warning"):
+        raise RuntimeError(generated["warning"])
+    publish_bilibili(job_id, BilibiliDraft(
+        title=generated["title"], desc=generated["desc"], tags=generated["tags"],
+        tid=generated["tid"]))
+
+
 @app.put("/api/jobs/{job_id}/bilibili")
 def save_job_bilibili(job_id: str, body: BilibiliDraft):
     get_job(job_id)
@@ -1364,6 +1807,8 @@ def save_job_bilibili(job_id: str, body: BilibiliDraft):
 @app.post("/api/jobs/{job_id}/bilibili/publish")
 def publish_bilibili(job_id: str, body: BilibiliDraft):
     job = get_job(job_id)
+    if job.get("batch_id"):
+        raise HTTPException(409, "批处理子任务不支持 B 站投稿")
     video = DATA / f"{job_id}-dubbed.mp4"
     if not video.is_file():
         raise HTTPException(409, "请先生成配音成片")

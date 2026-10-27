@@ -27,32 +27,37 @@ const labels = {
   failed: "失败",
   interrupted: "已中断",
 };
-const jobLabel = (j) =>
-  j.status === "running" && j.stage === "download"
-    ? "YouTube 下载中"
-    : j.dubbing_status === "done"
-    ? "成片完成"
-    : j.dubbing_status === "needs_review"
-      ? "配音待复核"
-      : j.dubbing_status === "failed"
-        ? "配音失败"
-        : j.dubbing_status === "queued"
-          ? "等待配音"
-          : j.dubbing_status === "running"
-            ? j.stage === "render"
-              ? "成片合成中"
-              : "配音中"
-            : j.translation_status === "done"
-              ? "翻译完成"
-              : j.translation_status === "failed"
-                ? "翻译失败"
-                : j.translation_status === "correcting"
-                  ? "英文校正中"
-                  : j.translation_status === "queued" ||
-                      j.translation_status === "glossary" ||
-                      j.translation_status === "running"
-                    ? "翻译中"
-                    : labels[j.status] || j.status;
+const jobHasFailure = (j) =>
+  j.kind === "batch"
+    ? j.status === "failed" || Number(j.failed) > 0
+    : [j.status, j.translation_status, j.dubbing_status].includes("failed");
+const jobLabel = (j) => {
+  if (j.kind === "batch") {
+    if (jobHasFailure(j)) return Number(j.failed) > 0 ? `${Number(j.failed)} 个失败` : "部分失败";
+    return ({ done: "全部完成", running: "处理中", paused: "已暂停", review: "待复核", created: "待处理" }[j.status] || j.status);
+  }
+  if (j.dubbing_status === "failed") return "配音失败";
+  if (j.translation_status === "failed") return "翻译失败";
+  if (j.status === "failed") return "处理失败";
+  if (j.status === "paused") return "已暂停";
+  if (j.pause_requested) return "正在暂停";
+  if (j.status === "running" && j.stage === "download") return "YouTube 下载中";
+  if (j.dubbing_status === "done") return "成片完成";
+  if (j.dubbing_status === "needs_review") return "配音待复核";
+  if (j.dubbing_status === "queued") return "等待配音";
+  if (j.dubbing_status === "running")
+    return j.stage === "publish" ? "成片输出中" : j.stage === "render" ? "成片合成中" : "配音中";
+  if (j.translation_status === "done") return "翻译完成";
+  if (j.translation_status === "correcting") return "英文校正中";
+  if (["queued", "glossary", "running"].includes(j.translation_status)) return "翻译中";
+  return labels[j.status] || j.status;
+};
+const jobNeedsReview = (j) =>
+  !jobHasFailure(j) &&
+  (j.kind === "batch"
+    ? j.status === "review"
+    : j.dubbing_status === "needs_review" ||
+      (j.status === "ready" && j.translation_status !== "done"));
 const stages = [
   "import",
   "separate",
@@ -73,8 +78,8 @@ const stageNames = [
   "译前 JSON",
   "英文校正",
   "术语分析",
-  "DeepSeek 翻译",
-  "Azure 配音",
+  "翻译",
+  "配音",
   "成片合成",
 ];
 const stageIndex = (j) =>
@@ -83,7 +88,7 @@ const stageIndex = (j) =>
     : j.dubbing_status === "needs_review"
       ? 9
       : j.dubbing_status === "running" || j.dubbing_status === "failed"
-        ? j.stage === "render"
+        ? ["render", "publish"].includes(j.stage)
           ? 9
           : 8
         : j.dubbing_status === "queued"
